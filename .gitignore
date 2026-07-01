@@ -1,0 +1,10 @@
+/.bundle/
+/pkg/
+/tmp/
+/coverage/
+/doc/
+*.gem
+Gemfile.lock
+.rspec_status
+.DS_Store
+/.ruby-lsp/
