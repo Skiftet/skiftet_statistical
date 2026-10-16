@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The bandit simulations, nightly (the simulations job below).
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,6 +15,8 @@ permissions:
 jobs:
   test:
     name: Test (Ruby ${{ matrix.ruby }})
+    # Not on the nightly schedule: that run is the simulations alone.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -24,10 +30,12 @@ jobs:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
       - name: Run tests
+        # spec/spec_helper.rb leaves out the examples tagged `simulation: true` unless SIMULATIONS=1.
         run: bundle exec rspec
 
   lint:
     name: Lint (RuboCop)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -37,3 +45,82 @@ jobs:
           bundler-cache: true
       - name: RuboCop
         run: bundle exec rubocop
+
+  # Did this push or pull request change what the simulations measure? The bandit rule
+  # (lib/skiftet_statistical/bandit/), the draws it is built on (sampler.rb, joint_beta.rb), the
+  # simulations themselves (spec/simulations/) or this workflow.
+  bandit-changes:
+    name: Bandit files changed?
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            base="$PR_BASE"
+            range="$PR_BASE...$HEAD_SHA"
+          else
+            base="$PUSH_BEFORE"
+            range="$PUSH_BEFORE..$HEAD_SHA"
+          fi
+          # No usable base (a new branch, a force push past it): run the simulations.
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files=$(git diff --name-only "$range" -- \
+            lib/skiftet_statistical/bandit \
+            lib/skiftet_statistical/sampler.rb \
+            lib/skiftet_statistical/joint_beta.rb \
+            spec/simulations \
+            .github/workflows/ci.yml)
+          if [ -n "$files" ]; then
+            printf 'Changed:\n%s\n' "$files"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The bandit simulations (spec/simulations, tagged `simulation: true`) take minutes, so they are
+  # not in every run: nightly, by hand (workflow_dispatch), and on a push or pull request that
+  # changed what they measure. Their measured results: README.md, "Bandit simulations: measured
+  # results".
+  simulations:
+    name: Simulations (bandit)
+    needs: bandit-changes
+    if: >-
+      !cancelled() && (
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch' ||
+        needs.bandit-changes.outputs.changed == 'true'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SIMULATIONS: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - name: Run the simulations
+        run: bundle exec rspec spec/simulations --format documentation --format json --out tmp/simulations.json
+      - name: Check that they ran
+        # RSpec passes a run of 0 examples, so an exclusion that stopped lifting would pass unseen.
+        run: |
+          ruby -rjson -e '
+            count = JSON.parse(File.read("tmp/simulations.json")).dig("summary", "example_count")
+            abort "the simulations ran #{count.inspect} examples" unless count.is_a?(Integer) && count.positive?
+            puts "#{count} simulation examples ran"
+          '
