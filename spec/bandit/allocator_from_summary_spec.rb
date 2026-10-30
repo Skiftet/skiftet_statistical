@@ -144,6 +144,11 @@ RSpec.describe SkiftetStatistical::Bandit::Allocator, ".from_summary" do
       expected.each { |arm, share| expect(actual[arm]).to be_within(1e-12).of(share), arm.inspect }
     end
 
+    # A refusal, labelled, with RSpec's own message kept (so a missing name still shows as itself).
+    def expect_refused(label, error = ArgumentError, &call)
+      aggregate_failures(label) { expect(&call).to raise_error(error) }
+    end
+
     let(:even) { { control: 0.5, a: 0.5 } }
 
     it "SL2 answers call's result shape" do
@@ -262,6 +267,98 @@ RSpec.describe SkiftetStatistical::Bandit::Allocator, ".from_summary" do
       ]
 
       results.each { |result| expect_weights(result[:weights], { control: 0.2, a: 0.8 }) }
+    end
+
+    it "SL2 shares 1 - F by the free arms' P(best), lifted onto a free arm's floor, then steps" do
+      # control fixed at 0.2; free P(best) a 0.9, b 0.1 (no leader: 0.9 < 0.95). Into m = 0.8: 0.72 / 0.08, b is
+      # under 0.10, pinned there, and a takes 0.7: the target a 0.7, b 0.1. From 0.4 / 0.4 the largest move is 0.3 >
+      # 0.15, lambda = 0.5: a 0.4 + 0.15 = 0.55, b 0.4 - 0.15 = 0.25. From the target itself, the step stays on it.
+      summary = { control: arm_summary(0.0, 0.05), a: arm_summary(0.9, 0.004), b: arm_summary(0.1, 0.05) }
+      stepped = decide(summary: summary, previous_weights: { control: 0.2, a: 0.4, b: 0.4 },
+                       fixed_shares: { control: 0.2 })
+      settled = decide(summary: summary, previous_weights: { control: 0.2, a: 0.7, b: 0.1 },
+                       fixed_shares: { control: 0.2 })
+
+      expect(stepped).to include(phase: :shifting, winner: nil, leader: nil)
+      expect_weights(stepped[:weights], { control: 0.2, a: 0.55, b: 0.25 })
+      expect_weights(settled[:weights], { control: 0.2, a: 0.7, b: 0.1 })
+    end
+
+    it "SL2 shares 1 - F by P(best) among three free arms" do
+      # control fixed at 0.2, so the free arms share m = 0.8; previous 0.2 / 0.3 / 0.3 / 0.2.
+      # - P(best) 0.5 / 0.3 / 0.2: 0.4 / 0.24 / 0.16, every one above 0.10; the largest move is a's 0.1 <= 0.15, so the
+      #   step reaches it.
+      # - P(best) 0.6 / 0.35 / 0.05: 0.48 / 0.28 / 0.04, c pinned at 0.10; a and b share 0.7 in proportion 0.6 : 0.35,
+      #   0.7 * 0.6 / 0.95 = 42/95 and 0.7 * 0.35 / 0.95 = 49/190; the largest move is a's 42/95 - 0.3 = 0.142... <=
+      #   0.15, so the step reaches it.
+      previous = { control: 0.2, a: 0.3, b: 0.3, c: 0.2 }
+      cases = {
+        [ 0.5, 0.3, 0.2 ] => { control: 0.2, a: 0.4, b: 0.24, c: 0.16 },
+        [ 0.6, 0.35, 0.05 ] => { control: 0.2, a: 42.0 / 95, b: 49.0 / 190, c: 0.1 }
+      }
+
+      cases.each do |(a, b, c), expected|
+        summary = { control: arm_summary(0.0, 0.05), a: arm_summary(a, 0.01), b: arm_summary(b, 0.02),
+                    c: arm_summary(c, 0.03) }
+        result = decide(summary: summary, previous_weights: previous, fixed_shares: { control: 0.2 })
+
+        expect(result).to include(phase: :shifting, winner: nil, leader: nil)
+        expect_weights(result[:weights], expected)
+      end
+    end
+
+    it "SL2 ignores a fixed arm's P(best) and expected loss: a fixed arm that would win is never the leader" do
+      # a fixed at 0.2 reads P(best) 0.99 and expected loss 0, which would crown it; it is ignored, and so is a nil
+      # pair. b (0.97) is not the leader either: its expected loss 0.003 is above 0.0025. The target: 0.03 / 0.97 over
+      # control and b into m = 0.8, 0.024 / 0.776, control pinned at 0.10 and b 0.7. From 0.4 / 0.4 the largest move
+      # 0.3 gives lambda 0.5: control 0.4 - 0.15 = 0.25, b 0.4 + 0.15 = 0.55.
+      free = { control: arm_summary(0.03, 0.03), b: arm_summary(0.97, 0.003) }
+      previous = { control: 0.4, a: 0.2, b: 0.4 }
+      [ arm_summary(0.99, 0.0), arm_summary(nil, nil) ].each do |fixed_arm|
+        summary = { control: free[:control], a: fixed_arm, b: free[:b] }
+        result = decide(summary: summary, previous_weights: previous, fixed_shares: { a: 0.2 })
+
+        expect(result).to include(phase: :shifting, winner: nil, leader: nil)
+        expect_weights(result[:weights], { control: 0.25, a: 0.2, b: 0.55 })
+      end
+    end
+
+    it "SL2 keeps the arm a floor names only at that floor, the others at Config#floor" do
+      # arm_floors { control: 0.05 }: P(best) 0 / 0.98 / 0.02 pins control at 0.05 and b at Config#floor 0.10 (0.02
+      # < 0.10); a takes 0.85. From 0.10 / 0.80 / 0.10 the largest move is 0.05: the step reaches it.
+      summary = { control: arm_summary(0.0, 0.05), a: arm_summary(0.98, 0.01), b: arm_summary(0.02, 0.03) }
+      result = decide(summary: summary, previous_weights: { control: 0.10, a: 0.80, b: 0.10 },
+                      arm_floors: { control: 0.05 })
+
+      expect(result).to include(phase: :shifting, leader: nil)
+      expect_weights(result[:weights], { control: 0.05, a: 0.85, b: 0.10 })
+    end
+
+    it "SL2 lifts a pause whose previous weights break a floor" do
+      # As call's: control pinned at 0.05, a and b 0.95 * 0.49 / 0.98 = 0.475 each.
+      summary = { control: arm_summary(0.2, 0.02), a: arm_summary(0.4, 0.01), b: arm_summary(0.4, 0.01) }
+      result = decide(summary: summary, status: "paused", previous_weights: { control: 0.02, a: 0.49, b: 0.49 },
+                      arm_floors: { control: 0.05 })
+
+      expect(result[:phase]).to eq(:paused)
+      expect_weights(result[:weights], { control: 0.05, a: 0.475, b: 0.475 })
+    end
+
+    it "SL2 makes call's checks: a non-arm key, a sum above 1, one arm in both, a fixed winner, every arm fixed" do
+      summary = { control: arm_summary(0.2, 0.02), a: arm_summary(0.4, 0.01), b: arm_summary(0.4, 0.01) }
+      refused = [
+        { arm_floors: { c: 0.02 } }, { fixed_shares: { "c" => 0.2 } }, { arm_floors: { control: 0.9 } },
+        { fixed_shares: { control: 0.5 }, arm_floors: { a: 0.6 } },
+        { arm_floors: { control: 0.05 }, fixed_shares: { control: 0.2 } },
+        { status: "won", winner_arm: :control, fixed_shares: { control: 0.2 } }
+      ]
+
+      refused.each do |options|
+        expect_refused(options.inspect) { decide(summary: summary, previous_weights: nil, **options) }
+      end
+      expect_refused("every arm fixed", described_class::FixedAllocation) do
+        decide(summary: summary, fixed_shares: { control: 0.3, a: 0.3, b: 0.4 })
+      end
     end
   end
 end

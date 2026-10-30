@@ -176,4 +176,141 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts" do
       expect(spread.call(none)).to be < spread.call(wide)
     end
   end
+
+  # SL9's baseline, every expected value worked by hand in Rationals from these formulas alone:
+  # - a row sums the visits i of one (cell, arm, covariate), weights w_i > 0 and values x_i: weight W = sum w_i,
+  #   value S = sum w_i * x_i, weight_squared Q = sum w_i^2, value_squared B = sum w_i^2 * x_i^2, cross C = sum w_i^2 *
+  #   x_i. All three of Q, B and C nil is one visit (x = S / W): Q = W^2, B = S^2, C = W * S;
+  # - e(c, a) is the mean of effects[c][a]; the reference arm, the one arm of the rows no cell of effects names, has
+  #   e = 0; S' = S - e * W;
+  # - pooled over every row: m = sum S' / sum W; per covariate value k, m_k = (sum over k's rows of S') / (sum over k's
+  #   rows of W) and s_k = m - m_k; a row's offset o = s_k - e(c, a);
+  # - per cell: mu_c = (sum over c's rows of (S + o * W)) / W_c, W_c = sum over c's rows of W; its variance (sum over
+  #   c's rows of (B + 2 * d * C + d^2 * Q)) / W_c^2, d = o - mu_c.
+  describe ".baseline" do
+    def baseline(**arguments)
+      SkiftetStatistical::AdditiveContrasts.baseline(**arguments)
+    end
+
+    # A refusal, labelled, with RSpec's own message kept (so a missing name still shows as itself).
+    def expect_refused(label, &call)
+      aggregate_failures(label) { expect(&call).to raise_error(ArgumentError) }
+    end
+
+    def expect_baseline(answer, expected)
+      expect(answer.keys).to contain_exactly(*expected.keys)
+      expected.each do |id, (mean, variance)|
+        expect(answer[id][0]).to be_within(1e-12).of(mean.to_f), "#{id} mean"
+        expect(answer[id][1]).to be_within(1e-12).of(variance.to_f), "#{id} variance"
+      end
+    end
+
+    # Three one-visit rows: two cells, the arms :ref and :a, the covariate values k1 and k2.
+    let(:visit_rows) do
+      [
+        { cell: "c1", arm: :ref, covariate: "k1", weight: 2.0, value: 2.0 },
+        { cell: "c1", arm: :a, covariate: "k2", weight: 1.0, value: 2.0 },
+        { cell: "c2", arm: :ref, covariate: "k2", weight: 1.0, value: 0.0 }
+      ]
+    end
+    let(:visit_effects) { { "c1" => { a: [ 1.0, 0.25 ] }, "c2" => { a: [ 0.5, 0.25 ] } } }
+
+    # Four rows of sums: two cells, both arms in each, both covariate values in each. Visits (w, x):
+    #   c1 ref k1: (1, 0), (1, 1) -> W 2, S 1, Q 2, B 1, C 1
+    #   c1 a   k2: (2, 3), one visit -> W 2, S 6, nil sums read as Q 4, B 36, C 12
+    #   c2 ref k2: (1, 2), (2, 3) -> W 3, S 8, Q 5, B 40, C 14
+    #   c2 a   k1: (1, 0), (2, 2) -> W 3, S 4, Q 5, B 16, C 8
+    let(:sum_rows) do
+      [
+        { cell: "c1", arm: :ref, covariate: "k1", weight: 2.0, value: 1.0, weight_squared: 2.0, value_squared: 1.0,
+          cross: 1.0 },
+        { cell: "c1", arm: :a, covariate: "k2", weight: 2.0, value: 6.0 },
+        { cell: "c2", arm: :ref, covariate: "k2", weight: 3.0, value: 8.0, weight_squared: 5.0, value_squared: 40.0,
+          cross: 14.0 },
+        { cell: "c2", arm: :a, covariate: "k1", weight: 3.0, value: 4.0, weight_squared: 5.0, value_squared: 16.0,
+          cross: 8.0 }
+      ]
+    end
+    let(:sum_effects) { { "c1" => { a: [ 0.5, 0.04 ] }, "c2" => { a: [ -1.0, 0.09 ] } } }
+
+    it "SL9 gives each cell its effect- and covariate-adjusted mean and variance on one-visit rows" do
+      # Rows (one visit each): c1 ref k1 W 2, S 2 (Q 4, B 4, C 4); c1 a k2 W 1, S 2 (Q 1, B 4, C 2); c2 ref k2 W 1,
+      # S 0 (Q 1, B 0, C 0). :ref is named by no cell, so it is the reference arm (e = 0); e(c1, a) = 1.
+      # S' = 2, 2 - 1 * 1 = 1, 0. m = (2 + 1 + 0) / (2 + 1 + 1) = 3/4; m_k1 = 2/2 = 1, s_k1 = -1/4; m_k2 = (1 + 0) /
+      # (1 + 1) = 1/2, s_k2 = 1/4. o: c1 ref -1/4, c1 a 1/4 - 1 = -3/4, c2 ref 1/4.
+      # c1: W_c 3, mu = (2 - 1/4 * 2 + 2 - 3/4 * 1) / 3 = (11/4) / 3 = 11/12. d: -1/4 - 11/12 = -7/6 and -3/4 - 11/12 =
+      # -5/3; terms 4 + 2 * (-7/6) * 4 + (49/36) * 4 = 1/9 and 4 + 2 * (-5/3) * 2 + 25/9 = 1/9; variance (2/9) / 9 =
+      # 2/81.
+      # c2: W_c 1, mu = (0 + 1/4 * 1) / 1 = 1/4; d = 0 and B = 0: variance 0.
+      expect_baseline(baseline(rows: visit_rows, effects: visit_effects),
+                      { "c1" => [ Rational(11, 12), Rational(2, 81) ], "c2" => [ Rational(1, 4), 0 ] })
+    end
+
+    it "SL9 reads a row of sums for several visits through its squared sums" do
+      # c1's ref row replaced by two visits of weight 1 and values 1/2 and 3/2: W 2, S 2 as before, Q 2, B 1/4 + 9/4 =
+      # 5/2, C 1/2 + 3/2 = 2. W and S are unchanged, so m, every m_k, every o and both means are; c1 ref's term is now
+      # 5/2 + 2 * (-7/6) * 2 + (49/36) * 2 = (45 - 84 + 49) / 18 = 5/9, and c1's variance (5/9 + 1/9) / 9 = 2/27.
+      rows = [ visit_rows[0].merge(weight_squared: 2.0, value_squared: 2.5, cross: 2.0), *visit_rows.drop(1) ]
+
+      expect_baseline(baseline(rows: rows, effects: visit_effects),
+                      { "c1" => [ Rational(11, 12), Rational(2, 27) ], "c2" => [ Rational(1, 4), 0 ] })
+    end
+
+    it "SL9 pools the covariate's group means over every cell, both arms in each cell, both values in each" do
+      # e(c1, a) = 1/2, e(c2, a) = -1, :ref 0. S' = S - e * W: c1 ref 1, c1 a 6 - 1/2 * 2 = 5, c2 ref 8, c2 a 4 + 1 *
+      # 3 = 7. m = (1 + 5 + 8 + 7) / (2 + 2 + 3 + 3) = 21/10.
+      # k1 (c1 ref, c2 a): m_k1 = (1 + 7) / (2 + 3) = 8/5, s_k1 = 21/10 - 16/10 = 1/2. k2 (c1 a, c2 ref): m_k2 = (5 +
+      # 8) / (2 + 3) = 13/5, s_k2 = 21/10 - 26/10 = -1/2. o = s_k - e: c1 ref 1/2, c1 a -1/2 - 1/2 = -1, c2 ref -1/2,
+      # c2 a 1/2 + 1 = 3/2.
+      # c1: W_c 4, mu = (1 + 1/2 * 2 + 6 - 1 * 2) / 4 = 3/2. d: 1/2 - 3/2 = -1 and -1 - 3/2 = -5/2; terms 1 + 2 * (-1)
+      # * 1 + 1 * 2 = 1 and 36 + 2 * (-5/2) * 12 + (25/4) * 4 = 1; variance 2 / 16 = 1/8.
+      # c2: W_c 6, mu = (8 - 1/2 * 3 + 4 + 3/2 * 3) / 6 = 15/6 = 5/2. d: -1/2 - 5/2 = -3 and 3/2 - 5/2 = -1; terms 40
+      # + 2 * (-3) * 14 + 9 * 5 = 1 and 16 + 2 * (-1) * 8 + 1 * 5 = 5; variance 6 / 36 = 1/6.
+      # A cell of effects with no row (c3) is left out, and the effects' variances are never read.
+      effects = sum_effects.merge("c3" => { a: [ 2.0, 0.01 ] })
+      wider = effects.transform_values { |by_arm| by_arm.transform_values { |(mean, _variance)| [ mean, 9.0 ] } }
+      expected = { "c1" => [ Rational(3, 2), Rational(1, 8) ], "c2" => [ Rational(5, 2), Rational(1, 6) ] }
+
+      expect_baseline(baseline(rows: sum_rows, effects: effects), expected)
+      expect_baseline(baseline(rows: sum_rows, effects: wider), expected)
+    end
+
+    it "SL9 reads a row whose three squared sums are nil as one visit" do
+      # c1 a's nil row is (w 2, x 3): Q = W^2 = 4, B = S^2 = 36, C = W * S = 12, so the row given those sums answers
+      # the same. Two visits of the same W and S, (1, 2) and (1, 4) (Q 2, B 4 + 16 = 20, C 2 + 4 = 6), move nothing
+      # but c1 a's term: 20 + 2 * (-5/2) * 6 + (25/4) * 2 = 5/2, c1's variance (1 + 5/2) / 16 = 7/32.
+      explicit = [ sum_rows[0], sum_rows[1].merge(weight_squared: 4.0, value_squared: 36.0, cross: 12.0),
+                   *sum_rows.drop(2) ]
+      two_visits = [ sum_rows[0], sum_rows[1].merge(weight_squared: 2.0, value_squared: 20.0, cross: 6.0),
+                     *sum_rows.drop(2) ]
+      c2 = [ Rational(5, 2), Rational(1, 6) ]
+
+      expect_baseline(baseline(rows: explicit, effects: sum_effects), { "c1" => [ Rational(3, 2), Rational(1, 8) ],
+                                                                        "c2" => c2 })
+      expect_baseline(baseline(rows: two_visits, effects: sum_effects), { "c1" => [ Rational(3, 2), Rational(7, 32) ],
+                                                                          "c2" => c2 })
+    end
+
+    it "SL9 refuses a row whose arm has no effect for its cell, and two arms that no cell names" do
+      # a is named in c2, so :ref is the reference arm and c1's a row needs e(c1, a): missing, with or without c1.
+      expect { baseline(rows: sum_rows, effects: { "c2" => sum_effects["c2"] }) }.to raise_error(ArgumentError)
+      expect { baseline(rows: sum_rows, effects: { "c1" => {}, "c2" => sum_effects["c2"] }) }
+        .to raise_error(ArgumentError)
+      # A row of a third arm :b that no cell names: :ref and :b would both be the reference arm.
+      third = sum_rows + [ { cell: "c2", arm: :b, covariate: "k1", weight: 1.0, value: 1.0 } ]
+      expect { baseline(rows: third, effects: sum_effects) }.to raise_error(ArgumentError)
+    end
+
+    it "SL9 refuses a row with some but not all three squared sums, and a weight that is not above 0" do
+      partial = [ { weight_squared: 4.0 }, { value_squared: 36.0, cross: 12.0 }, { weight_squared: 4.0, cross: 12.0 } ]
+      partial.each do |sums|
+        rows = [ sum_rows[0], sum_rows[1].merge(sums), *sum_rows.drop(2) ]
+        expect_refused(sums.inspect) { baseline(rows: rows, effects: sum_effects) }
+      end
+      [ 0.0, -2.0 ].each do |weight|
+        rows = [ sum_rows[0], sum_rows[1].merge(weight: weight), *sum_rows.drop(2) ]
+        expect_refused(weight.inspect) { baseline(rows: rows, effects: sum_effects) }
+      end
+    end
+  end
 end

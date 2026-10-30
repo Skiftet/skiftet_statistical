@@ -82,7 +82,11 @@ jobs:
             lib/skiftet_statistical/bandit \
             lib/skiftet_statistical/sampler.rb \
             lib/skiftet_statistical/joint_beta.rb \
+            lib/skiftet_statistical/cholesky.rb \
+            lib/skiftet_statistical/linear_value.rb \
+            lib/skiftet_statistical/hierarchical_rates.rb \
             spec/simulations \
+            spec/pins \
             .github/workflows/ci.yml)
           if [ -n "$files" ]; then
             printf 'Changed:\n%s\n' "$files"

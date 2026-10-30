@@ -17,6 +17,9 @@ require_relative "skiftet_statistical/bandit"
 require_relative "skiftet_statistical/bandit/weighted_posterior"
 require_relative "skiftet_statistical/bandit/allocator"
 require_relative "skiftet_statistical/bandit/win_hold"
+require_relative "skiftet_statistical/cholesky"
+require_relative "skiftet_statistical/linear_value"
+require_relative "skiftet_statistical/hierarchical_rates"
 
 # Skiftet's shared statistics toolkit — a home for reusable, app-independent
 # statistical analysis code across the workspace.
