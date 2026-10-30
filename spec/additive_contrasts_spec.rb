@@ -1,0 +1,179 @@
+# frozen_string_literal: true
+
+# SL9: additive normal contrasts with crossed groupings. Each cell holds every arm's contrast against the reference arm
+# (estimate, sampling variance), its tree path [root, ..., leaf] and its other groupings { name => key }. The model:
+# delta(a | cell) = delta_root(a) + u_tree(a) + sum over groupings g of u_g(a), the tree nested (a node's deviation
+# N(0, tau^2 of its depth), "tree:1" the first level under the root), every other grouping crossed (N(0, tau^2_g)).
+# Variances by moments on the contrasts, tau^2 = max(0, weighted spread of the group estimates - their mean sampling
+# variance), per depth, grouping and arm; normal-normal posteriors; `variances:` holds the variances it names fixed.
+# The checks below hold whatever the moment's weights are: each is worked out by hand in its comment.
+RSpec.describe "SkiftetStatistical::AdditiveContrasts" do
+  def fit(**arguments)
+    SkiftetStatistical::AdditiveContrasts.fit(**arguments)
+  end
+
+  def cell(id, contrasts, tree, groups = {})
+    { id: id, contrasts: contrasts, tree: tree, groups: groups }
+  end
+
+  def cell_mean(answer, id, arm = :a)
+    answer.dig(:cells, id, arm, 0)
+  end
+
+  # Five cells on a two-level tree (m1 > l1, l2; m2 > l3, l4, l5) with one crossed grouping "g", two arms.
+  let(:nested) do
+    [
+      cell(1, { a: [ 0.10, 0.004 ], b: [ -0.02, 0.003 ] }, %i[root m1 l1], { "g" => "x" }),
+      cell(2, { a: [ 0.30, 0.006 ], b: [ 0.05, 0.004 ] }, %i[root m1 l2], { "g" => "y" }),
+      cell(3, { a: [ -0.20, 0.005 ], b: [ 0.01, 0.002 ] }, %i[root m2 l3], { "g" => "x" }),
+      cell(4, { a: [ 0.05, 0.003 ], b: [ 0.12, 0.005 ] }, %i[root m2 l4], { "g" => "y" }),
+      cell(5, { a: [ 0.25, 0.004 ], b: [ -0.06, 0.006 ] }, %i[root m2 l5], { "g" => "x" })
+    ]
+  end
+
+  # One level under the root, no other grouping, equal sampling variances 1.
+  def one_level(estimates)
+    estimates.each_with_index.map { |estimate, index| cell(index + 1, { a: [ estimate, 1.0 ] }, [ :root, :"n#{index + 1}" ]) }
+  end
+
+  describe ".fit" do
+    it "SL9 fits no variance between two cells whose contrasts are equal, and leaves both at that contrast" do
+      # The spread of two equal estimates is 0, below their mean sampling variance: tau^2 = max(0, 0 - v) = 0.
+      # Every estimate is 0.3, so every weighted mean of them, and every posterior, is 0.3.
+      answer = fit(cells: [ cell(1, { a: [ 0.3, 0.01 ] }, %i[root x]), cell(2, { a: [ 0.3, 0.02 ] }, %i[root y]) ],
+                   arms: %i[a])
+
+      expect(answer.dig(:variances, "tree:1", :a)).to eq(0.0)
+      expect(cell_mean(answer, 1)).to be_within(1e-12).of(0.3)
+      expect(cell_mean(answer, 2)).to be_within(1e-12).of(0.3)
+    end
+
+    it "SL9 answers variances per depth and grouping, effects per key and posteriors per cell, each per arm" do
+      [ 1, 5 ].each do |sweeps|
+        answer = fit(cells: nested, arms: %i[a b], sweeps: sweeps)
+
+        expect(answer.keys).to contain_exactly(:variances, :effects, :cells)
+        expect(answer[:variances].keys).to include("tree:1", "tree:2", "g")
+        %w[tree:1 tree:2 g].each do |name|
+          expect(answer[:variances][name].keys).to contain_exactly(:a, :b)
+          expect(answer[:variances][name].values).to all(be_a(Float).and(be >= 0.0))
+        end
+        expect(answer[:effects].keys).to include("tree:1", "tree:2", "g")
+        expect(answer[:effects]["tree:1"].keys).to contain_exactly(:m1, :m2)
+        expect(answer[:effects]["tree:2"].keys).to contain_exactly(:l1, :l2, :l3, :l4, :l5)
+        expect(answer[:effects]["g"].keys).to contain_exactly("x", "y")
+        answer[:effects].each_value do |by_key|
+          by_key.each_value do |by_arm|
+            expect(by_arm.keys).to contain_exactly(:a, :b)
+            by_arm.each_value { |pair| expect(pair).to match([ a_kind_of(Float), a_value >= 0.0 ]) }
+          end
+        end
+        expect(answer[:cells].keys).to contain_exactly(1, 2, 3, 4, 5)
+        answer[:cells].each_value do |by_arm|
+          expect(by_arm.keys).to contain_exactly(:a, :b)
+          by_arm.each_value { |pair| expect(pair).to match([ a_kind_of(Float), a_value > 0.0 ]) }
+        end
+      end
+    end
+
+    it "SL9 fits every variance at 0 and every cell at the common contrast when all contrasts are equal" do
+      # Equal estimates (0.2) with unequal sampling variances: every group's spread is 0, so every tau^2 is 0; the
+      # root and every posterior are weighted means of 0.2 alone.
+      equal = nested.map do |row|
+        row.merge(contrasts: row[:contrasts].transform_values { |(_estimate, variance)| [ 0.2, variance ] })
+      end
+      answer = fit(cells: equal, arms: %i[a b])
+
+      answer[:variances].each do |name, by_arm|
+        by_arm.each { |arm, variance| expect(variance).to eq(0.0), "#{name} #{arm}" }
+      end
+      equal.each do |row|
+        %i[a b].each { |arm| expect(cell_mean(answer, row[:id], arm)).to be_within(1e-12).of(0.2) }
+      end
+    end
+
+    it "SL9 shrinks a one-level tree's nodes part of the way toward the root, the plain normal shrinkage" do
+      # Estimates 0, 1 and 5, sampling variance 1 each: the root is their mean 2.0 under any weighting by variance.
+      # Their spread about it, 14 / 3 (7 with n - 1), is above the sampling variance 1, so tau^2 > 0 and each node's
+      # posterior mean lies strictly between its estimate and 2.0; its posterior variance is below its own 1.
+      answer = fit(cells: one_level([ 0.0, 1.0, 5.0 ]), arms: %i[a])
+
+      expect(answer.dig(:variances, "tree:1", :a)).to be > 0.0
+      { 1 => 0.0, 2 => 1.0, 3 => 5.0 }.each do |id, estimate|
+        low, high = [ estimate, 2.0 ].minmax
+        expect(cell_mean(answer, id)).to be > low
+        expect(cell_mean(answer, id)).to be < high
+        expect(answer.dig(:cells, id, :a, 1)).to be_between(0.0, 1.0).exclusive
+      end
+      expect(cell_mean(answer, 3) - cell_mean(answer, 1)).to be < 5.0
+    end
+
+    it "SL9 shrinks a symmetric one-level tree symmetrically about its root" do
+      # Estimates -3, 0 and 3 with variance 1: the root is 0 by symmetry, the middle node stays at 0 and the outer two
+      # are pulled the same way in: mean(n1) = -mean(n3), strictly between -3 and 0.
+      answer = fit(cells: one_level([ -3.0, 0.0, 3.0 ]), arms: %i[a])
+
+      expect(cell_mean(answer, 2)).to be_within(1e-12).of(0.0)
+      expect(cell_mean(answer, 1)).to be_within(1e-12).of(-cell_mean(answer, 3))
+      expect(cell_mean(answer, 1)).to be_between(-3.0, 0.0).exclusive
+    end
+
+    it "SL9 fits each arm on its own contrasts" do
+      # No term joins two arms, so b's answer is the answer of a fit of b's contrasts alone.
+      both = fit(cells: nested, arms: %i[a b])
+      alone = fit(cells: nested.map { |row| row.merge(contrasts: row[:contrasts].slice(:b)) }, arms: %i[b])
+
+      both[:cells].each do |id, by_arm|
+        expect(by_arm[:b][0]).to be_within(1e-12).of(alone[:cells][id][:b][0])
+        expect(by_arm[:b][1]).to be_within(1e-12).of(alone[:cells][id][:b][1])
+      end
+      both[:variances].each do |name, by_arm|
+        expect(by_arm[:b]).to be_within(1e-12).of(alone[:variances][name][:b])
+      end
+    end
+  end
+
+  describe ".fit with variances:" do
+    it "SL9 keeps an earlier fit's variances: the answer's variances equal them" do
+      earlier = fit(cells: nested, arms: %i[a b])
+      later_cells = nested.map do |row|
+        row.merge(contrasts: row[:contrasts].transform_values { |(estimate, variance)| [ -estimate + 0.05, variance ] })
+      end
+      later = fit(cells: later_cells, arms: %i[a b], variances: earlier[:variances])
+
+      expect(later[:variances]).to eq(earlier[:variances])
+    end
+
+    it "SL9 takes no moment step for a named variance, and fits by moments the ones it does not name" do
+      # All contrasts equal, so moments give 0 everywhere; "tree:1" for a is named at 0.25 and stays 0.25, while
+      # "tree:1" for b and every other variance are fitted: 0. With every estimate equal, each cell stays at it.
+      equal = nested.map do |row|
+        row.merge(contrasts: row[:contrasts].transform_values { |(_estimate, variance)| [ 0.2, variance ] })
+      end
+      answer = fit(cells: equal, arms: %i[a b], variances: { "tree:1" => { a: 0.25 } })
+
+      expect(answer.dig(:variances, "tree:1", :a)).to eq(0.25)
+      expect(answer.dig(:variances, "tree:1", :b)).to eq(0.0)
+      expect(answer.dig(:variances, "tree:2", :a)).to eq(0.0)
+      expect(answer.dig(:variances, "g", :a)).to eq(0.0)
+      equal.each { |row| expect(cell_mean(answer, row[:id])).to be_within(1e-12).of(0.2) }
+    end
+
+    it "SL9 still fits the effects under fixed variances: a wide one leaves each node near its estimate" do
+      # tau^2 = 1e6 against a sampling variance of 1: each node keeps all but about 1e-6 of its distance from the root,
+      # so it sits within 1e-4 of its estimate. Fixed at 0, every node is pulled further in: the spread of the
+      # posterior means is smaller than under 1e6.
+      cells = one_level([ 0.0, 1.0, 5.0 ])
+      wide = fit(cells: cells, arms: %i[a], variances: { "tree:1" => { a: 1e6 } })
+      none = fit(cells: cells, arms: %i[a], variances: { "tree:1" => { a: 0.0 } })
+
+      expect(wide.dig(:variances, "tree:1", :a)).to eq(1e6)
+      expect(none.dig(:variances, "tree:1", :a)).to eq(0.0)
+      { 1 => 0.0, 2 => 1.0, 3 => 5.0 }.each do |id, estimate|
+        expect(cell_mean(wide, id)).to be_within(1e-4).of(estimate)
+      end
+      spread = ->(answer) { cell_mean(answer, 3) - cell_mean(answer, 1) }
+      expect(spread.call(none)).to be < spread.call(wide)
+    end
+  end
+end
