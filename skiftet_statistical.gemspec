@@ -6,7 +6,6 @@ Gem::Specification.new do |spec|
   spec.name = "skiftet_statistical"
   spec.version = SkiftetStatistical::VERSION
   spec.authors = [ "Skiftet" ]
-  spec.email = [ "joel@skram.la" ]
 
   spec.summary = "Multi-armed bandit policies (Thompson Sampling, epsilon-greedy, UCB1, Softmax) for Ruby."
   spec.description = <<~DESC.strip
