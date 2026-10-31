@@ -37,16 +37,29 @@ module SkiftetStatistical
   # A part with no variance is drawn at its mean and still takes its normal, so the numbers taken never depend on the
   # data. A seeded caller gets the same rows only while this order holds, never with a draw added, dropped or moved.
   #
+  # Where Cholesky.factor refuses the covariance, L is Cholesky.root's square root S of it, read the same way with the
+  # same K * P normals: the draw order holds and the joint normal is the same one, but S is not triangular, so its rows
+  # are not the rows the factor would give. That is a covariance of lower rank whose rounding the given order cannot
+  # carry. `rounding:` (a finite number of at least 0, 0.0 by default) is the largest rounding bound of the covariance's
+  # entries, read only there: a caller with SharedCredit's estimate hands `estimate.rounding`, so a covariance summed
+  # from rows is never refused for its own rounding. An entry cleared to 0 under its bound may be that bound and its own
+  # rounding from the exact one, so Cholesky.root is given twice `rounding`. A covariance that neither takes raises.
+  #
   # Everything is checked before the first random number (ArgumentError): 1 to 7 arms and 1 to 12 parts, each named
   # once by a Symbol or a String (a part shared by one weight is summed into one by the caller); `means` an Array of
   # P finite numbers per arm; `covariance` (K * P) rows of K * P, symmetric and positive semidefinite (Cholesky);
   # each parameter one kind of finite numbers (uniform lo <= hi, normal sd >= 0, clip lo <= hi); `weights` callable,
   # answering a Hash with a finite number for every part (read by Symbol or String; a key for no part is left out).
+  # A finite number is a real Numeric that stays finite as a Float (an Integer or Rational beyond a Float's range, a
+  # Complex, a NaN and an infinity are refused alike), the one number check the library's modules share.
   # The weights are first read at the parameters' centres, so a callable that leaves out a part is refused before any
   # draw; a draw whose weights leave one out raises too.
   module LinearValue
     MAX_ARMS = 7
     MAX_PARTS = 12
+    # How many times its rounding bound an entry of a covariance may be from the exact one: cleared to 0 under the
+    # bound, it may have been a bound and a half away. Cholesky.root is given this much.
+    ENTRY_ROUNDING = 2.0
 
     class << self
       # Per arm (the arms as given): `point` the value at every parameter's centre (the fixed value, the uniform's
@@ -54,9 +67,9 @@ module SkiftetStatistical
       # the drawn values, `lower` and `upper` their equal-tailed `credible_mass` interval (Descriptive.percentile),
       # `p_best` the share of draws the arm is best in (a tie split equally) and `expected_loss` the mean of the draw's
       # best value minus the arm's. Built on the rows each_draw yields: the same seed gives the same rows.
-      def summary(arms:, parts:, means:, covariance:, parameters:, weights:, draws:, rng:, credible_mass: 0.95)
+      def summary(arms:, parts:, means:, covariance:, parameters:, weights:, draws:, rng:, credible_mass: 0.95, rounding: 0.0)
         model = Model.new(arms: arms, parts: parts, means: means, covariance: covariance, parameters: parameters,
-                          weights: weights)
+                          weights: weights, rounding: rounding)
         draws = draw_count(draws)
         raise ArgumentError, "summary needs at least one draw" if draws.zero?
 
@@ -96,9 +109,9 @@ module SkiftetStatistical
       # Yields one Array per draw, each arm's value V in `arms` order, and returns nil. Without a block the rows are
       # drawn at once and an Enumerator over them is answered, so reading it again gives the same rows and the RNG is
       # left where the block form leaves it.
-      def each_draw(arms:, parts:, means:, covariance:, parameters:, weights:, draws:, rng:, &block)
+      def each_draw(arms:, parts:, means:, covariance:, parameters:, weights:, draws:, rng:, rounding: 0.0, &block)
         model = Model.new(arms: arms, parts: parts, means: means, covariance: covariance, parameters: parameters,
-                          weights: weights)
+                          weights: weights, rounding: rounding)
         draws = draw_count(draws)
         unless block
           rows = []
@@ -135,7 +148,7 @@ module SkiftetStatistical
 
       attr_reader :arms, :point
 
-      def initialize(arms:, parts:, means:, covariance:, parameters:, weights:)
+      def initialize(arms:, parts:, means:, covariance:, parameters:, weights:, rounding:)
         @arms = names(arms, "arms", MAX_ARMS)
         @parts = names(parts, "parts", MAX_PARTS)
         @size = @arms.size * @parts.size
@@ -144,7 +157,7 @@ module SkiftetStatistical
         raise ArgumentError, "weights must respond to #call, got #{weights.class}" unless weights.respond_to?(:call)
 
         @weights = weights
-        @lower, @bands = factor_bands(covariance)
+        @lower, @bands = factor_bands(covariance, read_rounding(rounding))
         @point = values(part_weights(centres), @means)
       end
 
@@ -222,7 +235,7 @@ module SkiftetStatistical
       end
 
       def clip(value, label)
-        unless value.is_a?(Array) && value.size == 2 && value.all? { |bound| number?(bound) && !bound.to_f.nan? }
+        unless value.is_a?(Array) && value.size == 2 && value.all? { |bound| clip_bound?(bound) }
           raise ArgumentError, "#{label} clip must be two numbers [lo, hi], got #{value.inspect}"
         end
 
@@ -232,19 +245,38 @@ module SkiftetStatistical
         bounds
       end
 
+      # A real number, an infinity allowed only as an infinity: one no Float holds is not read as one.
+      def clip_bound?(bound)
+        number?(bound) && !bound.to_f.nan? && (bound.to_f.finite? || !bound.finite?)
+      end
+
+      def read_rounding(value)
+        number = finite(value, "rounding")
+        raise ArgumentError, "rounding must be at least 0, got #{value.inspect}" if number.negative?
+
+        number
+      end
+
       # The factor's rows and, per row, the band [first, last] of its nonzero columns (first > last for a row of
       # zeros), so a row skips the zero blocks of independent arms; a zero inside the band adds a zero to its sum.
-      def factor_bands(covariance)
+      def factor_bands(covariance, rounding)
         unless covariance.is_a?(Array) && covariance.size == @size
           raise ArgumentError, "covariance must be #{@size} rows of #{@size} (arms x parts, arm-major)"
         end
 
-        lower = Cholesky.factor(covariance).map(&:freeze).freeze
+        lower = square_root(covariance, rounding).map(&:freeze).freeze
         bands = lower.map do |row|
           nonzero = row.each_index.reject { |column| row[column].zero? }
           nonzero.empty? ? [ 0, -1 ].freeze : [ nonzero.first, nonzero.last ].freeze
         end
         [ lower, bands.freeze ]
+      end
+
+      # The factor where it takes the covariance, so a covariance it takes draws its rows; the root where it refuses.
+      def square_root(covariance, rounding)
+        Cholesky.factor(covariance)
+      rescue ArgumentError
+        Cholesky.root(covariance, rounding: ENTRY_ROUNDING * rounding)
       end
 
       # z = means + L * n, each row summed left to right over its band.
@@ -318,10 +350,13 @@ module SkiftetStatistical
         value.is_a?(Numeric) && value.real?
       end
 
+      # A finite real number, finite as a Float too (an Integer or Rational beyond a Float's range is not), as a Float:
+      # the library's one number check.
       def finite(value, label)
-        raise ArgumentError, "#{label} must be a finite number, got #{value.inspect}" unless number?(value) && value.finite?
+        number = value.to_f if number?(value) && value.finite?
+        return number if number&.finite?
 
-        value.to_f
+        raise ArgumentError, "#{label} must be a finite number, got #{value.inspect}"
       end
     end
     private_constant :Model

@@ -281,7 +281,64 @@ module AllocatorSharesPins
   # SL15's tolerance for every Float here (none goes through lgamma).
   RELATIVE = 1e-12
 
+  # The floors the lift's sweep draws its Config from: the default, others whose Config#max_arms rounds up (1 / 0.15
+  # is 6.67 and 1 / 0.4 is 2.5, so seven and three arms over-fill the floor) or down, a Rational and an Integer one.
+  LIFT_FLOORS = [ 0.10, 0.05, 0.15, 0.2, 0.25, 0.3, 1.0 / 3, 0.4, 0.5, Rational(1, 10), 1 ].freeze
+
   module_function
+
+  # 0.2.0's private Allocator#with_floor (lib/skiftet_statistical/bandit/allocator.rb at 0.2.0), copied unchanged but
+  # for its two instance reads, @arms and @config.floor, which are its arguments here. The lift's reference.
+  def with_floor_020(arms, floor, target)
+    fixed = []
+    loop do
+      free = arms - fixed
+      mass = 1.0 - (fixed.size * floor)
+      free_total = free.sum { |arm| target.fetch(arm) }
+      scaled = free.to_h do |arm|
+        [ arm, free_total.positive? ? mass * target.fetch(arm) / free_total : mass / free.size ]
+      end
+      below = scaled.select { |_arm, share| share < floor }.keys
+      return arms.to_h { |arm| [ arm, fixed.include?(arm) ? floor : scaled.fetch(arm) ] } if below.empty?
+
+      fixed.concat(below)
+    end
+  end
+
+  # 0.2.0's convex step (the end of its private Allocator#step_toward, at 0.2.0), copied unchanged but for its
+  # instance reads, which are its arguments here. The step's reference.
+  def step_020(arms, max_step, previous, target)
+    largest = arms.map { |arm| (target.fetch(arm) - previous.fetch(arm)).abs }.max
+    lambda = largest > max_step ? max_step / largest : 1.0
+
+    arms.to_h { |arm| [ arm, previous.fetch(arm) + (lambda * (target.fetch(arm) - previous.fetch(arm))) ] }
+  end
+
+  # One random target (Symbol arms, Float shares) over 1 to Config#max_arms arms: every share 0 (the equal split), a
+  # won split, shares summing to 1, or raw shares among which some are 0, tiny, negative, large or exactly the floor.
+  def random_target(rng, config)
+    arms = (1..rng.rand(1..config.max_arms)).map { |index| :"arm#{index}" }
+    case rng.rand(5)
+    when 0 then arms.to_h { |arm| [ arm, 0.0 ] }
+    when 1 then arms.each_with_index.to_h { |arm, index| [ arm, index.zero? ? 0.95 : 0.05 / (arms.size - 1) ] }
+    when 2
+      raw = arms.to_h { |arm| [ arm, rng.rand ] }
+      total = raw.values.sum
+      raw.transform_values { |share| share / total }
+    else arms.to_h { |arm| [ arm, random_share(rng, config) ] }
+    end
+  end
+
+  def random_share(rng, config)
+    case rng.rand(8)
+    when 0 then 0.0
+    when 1 then rng.rand * 1e-6
+    when 2 then -rng.rand * 0.2
+    when 3 then rng.rand * 10
+    when 4 then config.floor.to_f
+    else rng.rand
+    end
+  end
 
   # The one rule: a Float within RELATIVE of the pin, relative to it; a pinned 0.0, 1.0 or infinity exactly.
   def close?(actual, expected)
@@ -459,6 +516,21 @@ RSpec.describe SkiftetStatistical::Bandit::Allocator, "per-arm share pins" do
       expect_sum_one(shifting[:weights], "shifting")
     end
 
+    it "SL15 reads each floor and fixed share by the one number check, its bound read on the Float" do
+      # Rational(1, 10**400) is a positive real number whose Float is 0.0, outside (0, 1] and (0, 1); 10**400 is a
+      # finite Integer whose Float is an infinity; a Rational just under 1 has the Float 1.0, outside (0, 1); a Complex
+      # is no real number. Each is refused, as the valid call beside them answers.
+      expect_weights(warm(arm_floors: { control: 0.5 }, fixed_shares: { b: 0.2 })[:weights],
+                     { control: 0.5, a: 0.3, b: 0.2 })
+
+      [ Rational(1, 10**400), 10**400, Complex(0.05, 0) ].each do |floor|
+        expect { warm(arm_floors: { control: floor }) }.to raise_error(ArgumentError), floor.inspect
+      end
+      [ Rational(1, 10**400), Rational((10**400) - 1, 10**400), 10**400, Complex(0.2, 0) ].each do |share|
+        expect { warm(fixed_shares: { b: share }) }.to raise_error(ArgumentError), share.inspect
+      end
+    end
+
     it "SL1 refuses a stored win of a fixed arm only while the status is won" do
       # Paused, the stored winner is not read: the equal split breaks control's fixed 0.2, so the free arms' equal
       # shares go through the lift, 0.4 each.
@@ -513,6 +585,184 @@ RSpec.describe SkiftetStatistical::Bandit::Allocator, "per-arm share pins" do
       expect_weights(plain[:weights], { control: 1.0 })
       expect(Marshal.dump(empty)).to eq(Marshal.dump(plain))
       expect(call_fixture(fixture)).to include(phase: :won, winner: :control, leader: :control)
+    end
+  end
+
+  describe "a free share against its floor" do
+    # On these tallies P(best) is 0 / 1 whatever the seed, so a's lead is held (hold_satisfied: false) and the target is
+    # control at its floor, a the rest.
+    def stepped(previous, **options)
+      described_class.call(arms: %i[control a], tallies: { control: tally(2_000, 100), a: tally(2_000, 400) },
+                           status: "running", winner_arm: nil, rng: Random.new(7), draws: AllocatorSharesPins::DRAWS,
+                           previous_weights: previous, hold_satisfied: false, **options)
+    end
+
+    # P(best) 0 / 1 / 0 with every floor 0.05: the target is 0.05 / 0.9 / 0.05, a's move from 0.45 is the largest (0.45),
+    # lambda 1/3. Float arithmetic in the library's order, so these compare bit for bit: what separates the two starts
+    # (under 4e-14) lies inside the 1e-12 relative of the pins above.
+    def stepped_three(previous, **options)
+      arms = %i[control a b]
+      described_class.call(arms: arms, tallies: { control: tally(2_000, 100), a: tally(2_000, 400), b: tally(2_000, 100) },
+                           status: "running", winner_arm: nil, rng: Random.new(7), draws: AllocatorSharesPins::DRAWS,
+                           previous_weights: previous, hold_satisfied: false,
+                           config: described_class::Config.new(floor: 0.05), **options)[:weights]
+    end
+
+    def step_from(previous)
+      arms = %i[control a b]
+      target = AllocatorSharesPins.with_floor_020(arms, 0.05, { control: 0.0, a: 1.0, b: 0.0 })
+
+      AllocatorSharesPins.step_020(arms, 0.15, previous, target)
+    end
+
+    def paused(previous, **options)
+      described_class.call(arms: %i[control a b], tallies: {}, status: "paused", winner_arm: nil, rng: Random.new(7),
+                           draws: 100, previous_weights: previous, **options)[:weights]
+    end
+
+    it "SL1 clamps a free share the step rounds under its floor; undeclared, the step's own rounding stays (SL14)" do
+      # Floor 0.05 from 0.18: the move 0.13 is under max_step, lambda 1, and 0.18 + (0.05 - 0.18) rounds to
+      # 0.04999999999999999.
+      previous = { control: 0.18, a: 0.82 }
+      config = described_class::Config.new(floor: 0.05)
+      rounded = 0.18 + (1.0 * (0.05 - 0.18))
+      declared = stepped(previous, config: config, arm_floors: { control: 0.05 })
+      undeclared = stepped(previous, config: config)
+
+      expect(rounded < 0.05).to be(true)
+      expect(undeclared[:weights][:control]).to eql(rounded)
+      expect(declared).to include(phase: :shifting, leader: :a)
+      expect(declared[:weights][:control]).to eql(0.05)
+      expect(declared[:weights][:a]).to eql(undeclared[:weights][:a])
+      expect_sum_one(declared[:weights], "declared")
+    end
+
+    it "SL1 clamps beside a fixed share and answers a Float for a Rational Config#floor" do
+      # With a fixed share: control's floor 0.05, c fixed at 0.1; control steps from 0.18 and a takes the rest. A
+      # Rational Config#floor keeps a clamped share a Float, as the step's every other share is.
+      fixed = described_class.call(arms: %i[control a c],
+                                   tallies: { control: tally(2_000, 100), a: tally(2_000, 400), c: tally(2_000, 100) },
+                                   status: "running", winner_arm: nil, rng: Random.new(7), draws: AllocatorSharesPins::DRAWS,
+                                   previous_weights: { control: 0.18, a: 0.72, c: 0.1 }, hold_satisfied: false,
+                                   arm_floors: { control: 0.05 }, fixed_shares: { c: 0.1 })
+      rational = stepped({ control: 0.18, a: 0.82 }, config: described_class::Config.new(floor: Rational(1, 20)),
+                         arm_floors: { a: 0.05 })
+
+      expect(fixed[:weights][:control]).to eql(0.05)
+      expect(fixed[:weights][:c]).to eql(0.1)
+      expect_sum_one(fixed[:weights], "fixed")
+      expect(rational[:weights][:control]).to eql(0.05)
+    end
+
+    it "SL1 reads a declared floor to 1e-12 in a pause: a share within it holds, one beyond it is lifted" do
+      floors = { control: 0.05 }
+      within = { control: 0.05 - 1e-13, a: 0.5, b: 0.45 + 1e-13 }
+      beyond = { control: 0.05 - 2e-12, a: 0.5, b: 0.45 + 2e-12 }
+
+      expect(Marshal.dump(paused(within, arm_floors: floors))).to eq(Marshal.dump(within))
+      expect(paused(beyond, arm_floors: floors)[:control]).to eql(0.05)
+      expect_sum_one(paused(beyond, arm_floors: floors), "beyond")
+    end
+
+    it "SL1 starts a declared step from a share within 1e-12 of its floor as it stands, and lifts one beyond it" do
+      # Within: the step starts from the shares as they are and control, which it leaves still under, is clamped.
+      # Beyond: control is pinned at 0.05 first and a and b share 0.95 in proportion (with every floor 0.05 the lift is
+      # 0.2.0's), then the step.
+      arms = %i[control a b]
+      within = { control: 0.05 - 1e-13, a: 0.45, b: 0.5 + 1e-13 }
+      beyond = { control: 0.05 - 2e-12, a: 0.45, b: 0.5 + 2e-12 }
+      floors = { control: 0.05 }
+
+      expect(Marshal.dump(stepped_three(within, arm_floors: floors)))
+        .to eq(Marshal.dump(step_from(within).merge(control: 0.05)))
+      expect(Marshal.dump(stepped_three(beyond, arm_floors: floors)))
+        .to eq(Marshal.dump(step_from(AllocatorSharesPins.with_floor_020(arms, 0.05, beyond))))
+    end
+
+    it "SL14 keeps 0.2.0's strict floor undeclared: a share 1e-13 under it is lifted before the step and a pause keeps it" do
+      arms = %i[control a b]
+      near = { control: 0.05 - 1e-13, a: 0.45, b: 0.5 + 1e-13 }
+      lifted = step_from(AllocatorSharesPins.with_floor_020(arms, 0.05, near))
+
+      expect(Marshal.dump(stepped_three(near))).to eq(Marshal.dump(lifted))
+      expect(Marshal.dump(stepped_three(near))).not_to eq(Marshal.dump(step_from(near)))
+      expect(Marshal.dump(paused(near))).to eq(Marshal.dump(near))
+    end
+  end
+
+  describe "the lift in public (Allocator.lift) and 0.2.0's private with_floor" do
+    # A caller that holds shares and no tallies reaches 0.2.0's floor as an allocator built with no tallies, no rng
+    # and one draw, through send; with_floor now hands its target, in the call's arm order, to Allocator.lift.
+    def seam(target, config, arms: target.keys)
+      described_class.new(arms: arms, tallies: {}, status: "running", winner_arm: nil, rng: nil, draws: 1,
+                          config: config).send(:with_floor, target)
+    end
+
+    it "SL1 answers 0.2.0's with_floor step for step, Marshal-identical, on 3 000 random targets" do
+      rng = Random.new(2_030)
+      seen = Hash.new(0)
+
+      3_000.times do |index|
+        floor = AllocatorSharesPins::LIFT_FLOORS[rng.rand(AllocatorSharesPins::LIFT_FLOORS.size)]
+        config = described_class::Config.new(floor: floor)
+        target = AllocatorSharesPins.random_target(rng, config)
+        reference = AllocatorSharesPins.with_floor_020(target.keys, floor, target)
+        expected = Marshal.dump(reference)
+        strings = target.transform_keys(&:to_s)
+
+        expect(Marshal.dump(described_class.lift(target, config: config))).to eq(expected), "##{index} #{target}"
+        expect(Marshal.dump(seam(target, config))).to eq(expected), "##{index} with_floor #{target}"
+        expect(Marshal.dump(described_class.lift(strings, config: config)))
+          .to eq(Marshal.dump(AllocatorSharesPins.with_floor_020(strings.keys, floor, strings))), "##{index} Strings"
+        expect(Marshal.dump(described_class.lift(target))).to eq(expected), "##{index} default" if floor.eql?(0.10)
+
+        pinned = reference.count { |_arm, share| share == floor }
+        seen[:equal_split] += 1 unless target.values.sum.positive?
+        seen[:none_pinned] += 1 if pinned.zero?
+        seen[:one_pinned] += 1 if pinned == 1
+        seen[:several_pinned] += 1 if pinned > 1
+        seen[:over_full] += 1 if target.size * floor > 1
+      end
+
+      expect(seen.values_at(:equal_split, :none_pinned, :one_pinned, :several_pinned, :over_full)).to all(be >= 50)
+    end
+
+    it "SL1 lifts a held won split onto the floor, keeps the keys as given and reads exact shares as their Floats" do
+      # 0.99 / 0.01: a is pinned at 0.10 and control takes 0.9 * 0.99 / 0.99 = 0.9.
+      expect_weights(described_class.lift({ control: 0.99, a: 0.01 }), { control: 0.9, a: 0.1 })
+      expect_weights(seam({ control: 0.99, a: 0.01 }, described_class::Config.new), { control: 0.9, a: 0.1 })
+      expect_weights(described_class.lift({ "control" => 0.99, a: 0.01 }), { "control" => 0.9, a: 0.1 })
+
+      [ { control: 1, a: 0 }, { control: Rational(99, 100), a: Rational(1, 100) } ].each do |exact|
+        floats = exact.transform_values(&:to_f)
+        expect(Marshal.dump(described_class.lift(exact))).to eq(Marshal.dump(described_class.lift(floats))), exact.inspect
+      end
+    end
+
+    it "SL1 with_floor reads the call's arms in their order, as 0.2.0's did: an extra key ignored, a missing one a KeyError" do
+      config = described_class::Config.new
+      target = { a: 0.01, control: 0.99, z: "not read" }
+      lifted = seam(target, config, arms: %i[control a])
+
+      expect(Marshal.dump(lifted))
+        .to eq(Marshal.dump(AllocatorSharesPins.with_floor_020(%i[control a], config.floor, target)))
+      expect(lifted.keys).to eq(%i[control a])
+      expect { seam({ control: 0.5 }, config, arms: %i[control a]) }.to raise_error(KeyError)
+    end
+
+    it "SL15 refuses weights, a config or a share the one number check refuses, through lift and with_floor alike" do
+      expect_weights(described_class.lift({ control: 0.5, a: 0.5 }), { control: 0.5, a: 0.5 })
+
+      [ nil, [ [ :control, 0.5 ] ], {}, (1..11).to_h { |index| [ :"arm#{index}", 0.1 ] } ].each do |weights|
+        expect { described_class.lift(weights) }.to raise_error(ArgumentError), weights.inspect
+      end
+      expect { described_class.lift({ control: 0.5 }, config: :defaults) }.to raise_error(ArgumentError)
+      [ nil, "0.5", Float::NAN, Float::INFINITY, -Float::INFINITY, Complex(0.5, 0), 10**400, Rational(10**400, 3) ]
+        .each do |share|
+          target = { control: 0.5, a: share }
+          expect { described_class.lift(target) }.to raise_error(ArgumentError), share.inspect
+          expect { seam(target, described_class::Config.new) }.to raise_error(ArgumentError), share.inspect
+        end
     end
   end
 end

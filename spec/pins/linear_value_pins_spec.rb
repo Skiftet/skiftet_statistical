@@ -285,6 +285,29 @@ RSpec.describe "SkiftetStatistical::LinearValue pins" do
         .to raise_error(ArgumentError)
     end
 
+    it "SL18 refuses a real number no Float holds and a complex number, wherever a finite number is read" do
+      [ 10**400, -(10**400), Rational(10**400, 3), Complex(1, 0) ].each do |bad|
+        {
+          "a mean" => inputs(means: means.merge(c: [ 0.09, bad ])),
+          "a fixed value" => inputs(parameters: parameters.merge(base: { fixed: bad })),
+          "a uniform bound" => inputs(parameters: parameters.merge(worth: { uniform: [ 2.0, bad ] })),
+          "a normal's mean" => inputs(parameters: parameters.merge(lift: { normal: [ bad, 0.2 ] })),
+          "a normal's spread" => inputs(parameters: parameters.merge(lift: { normal: [ 0.5, bad ] })),
+          "a weight" => inputs(weights: ->(_drawn) { { p: 1.0, q: bad } })
+        }.each do |label, call_inputs|
+          expect_refused_untouched("#{label} of #{bad.inspect}") { |r| linear_value.each_draw(**call_inputs, draws: 3, rng: r).to_a }
+          expect_refused_untouched("summary: #{label} of #{bad.inspect}") { |r| linear_value.summary(**call_inputs, draws: 3, rng: r) }
+        end
+      end
+    end
+
+    it "SL3 takes Integers and Rationals that a Float holds, as those Floats" do
+      as_floats = { a: [ 0.5, 3.0 ], b: [ 0.25, 1.0 ], c: [ 2.0, 0.0 ] }
+      as_given = { a: [ Rational(1, 2), 3 ], b: [ Rational(1, 4), 1 ], c: [ 2, 0 ] }
+
+      expect(rows_of(means: as_given)).to eq(rows_of(means: as_floats))
+    end
+
     it "SL3 leaves out a weight named for no part" do
       extra = ->(drawn) { weights.call(drawn).merge(r: 99.0, "s" => nil) }
 
@@ -383,6 +406,16 @@ RSpec.describe "SkiftetStatistical::LinearValue pins" do
       lower
     end
 
+    it "SL4 reads a trace not above 0 as no rounding: a pivot of exactly 0 passes, a negative pivot raises in its own column" do
+      expect(cholesky.factor([ [ 0.0 ] ])).to eq([ [ 0.0 ] ])
+      expect(cholesky.factor([ [ 0.0, 0.0 ], [ 0.0, 0.0 ] ])).to eq([ [ 0.0, 0.0 ], [ 0.0, 0.0 ] ])
+      # The trace is -1e-20. Column 0's pivot is exactly 0 and passes; column 1's is the negative one.
+      expect { cholesky.factor([ [ 0.0, 0.0 ], [ 0.0, -1e-20 ] ]) }
+        .to raise_error(ArgumentError, /pivot -1\.0e-20 in column 1/)
+      expect { cholesky.factor([ [ -1e-300 ] ]) }.to raise_error(ArgumentError, /pivot -1\.0e-300 in column 0/)
+      expect { cholesky.factor([ [ -1.0, 0.0 ], [ 0.0, 0.5 ] ]) }.to raise_error(ArgumentError, /pivot -1\.0 in column 0/)
+    end
+
     it "SL4 refuses a zero pivot with a residual under it, as not positive semidefinite" do
       {
         # A part with no variance that covaries: the first pivot is 0 and the residual under it is the entry itself.
@@ -464,6 +497,264 @@ RSpec.describe "SkiftetStatistical::LinearValue pins" do
         covaried[none][other] = covaried[other][none] = 0.5 * matrix[other][other]
         expect { cholesky.factor(covaried) }
           .to raise_error(ArgumentError, /not positive semidefinite/), "trial #{trial} size #{size} rank #{rank}"
+      end
+    end
+  end
+
+  # Cholesky.root: a square root taken largest pivot first. Every S below is worked by hand: the largest residual pivot
+  # gives the next column, sqrt(pivot) on its own row and residual / sqrt(pivot) on the rows left, and the rows left give
+  # up the products of that column. A matrix that rebuilds is held to 1e-12 of its largest entry, an invariant.
+  describe "Cholesky.root" do
+    def product(square)
+      square.map { |row| square.map { |other| row.zip(other).sum { |x, y| x * y } } }
+    end
+
+    def expect_root(matrix, pinned, label, **options)
+      square = cholesky.root(matrix, **options)
+      expect(square.size).to eq(pinned.size)
+      square.each_with_index do |row, i|
+        expect(row.size).to eq(pinned.size)
+        row.each_with_index { |value, j| expect_pin(value, pinned[i][j], "#{label} S[#{i}][#{j}]") }
+      end
+      square
+    end
+
+    def expect_rebuilt(square, matrix, within, label)
+      error = product(square).zip(matrix).flat_map { |row, given| row.zip(given).map { |x, y| (x - y).abs } }.max
+      expect(error).to be <= within, "#{label}: S * S^T is #{error} from the matrix"
+    end
+
+    it "takes the largest pivot first, so S is not triangular in the given order" do
+      # Row 1's 5 first: S[1][0] = sqrt 5, S[0][0] = 2 / sqrt 5. Row 0 is left with 4 - 4/5 = 3.2, so S[0][1] = sqrt 3.2.
+      matrix = [ [ 4.0, 2.0 ], [ 2.0, 5.0 ] ]
+      square = expect_root(matrix, [ [ 2.0 / Math.sqrt(5.0), Math.sqrt(3.2) ], [ Math.sqrt(5.0), 0.0 ] ], "definite")
+
+      expect_rebuilt(square, matrix, 1e-12 * 5.0, "definite")
+    end
+
+    it "ends at the matrix's rank: the columns after the last pivot kept are 0.0" do
+      # The Gram matrix of (1, 0), (2, 0), (1, 1). Row 1's 4 first: top 2, column (1, 2, 1). Row 0 is left with
+      # 1 - 1 = 0 and row 2 with 2 - 1 = 1; row 2's 1 gives (0, 0, 1); row 0's 0 reads as zero.
+      matrix = [ [ 1.0, 2.0, 1.0 ], [ 2.0, 4.0, 2.0 ], [ 1.0, 2.0, 2.0 ] ]
+      square = expect_root(matrix, [ [ 1.0, 0.0, 0.0 ], [ 2.0, 0.0, 0.0 ], [ 1.0, 1.0, 0.0 ] ], "rank two")
+
+      expect(product(square)).to eq(matrix)
+      expect_root([ [ 1.0, 2.0 ], [ 2.0, 4.0 ] ], [ [ 1.0, 0.0 ], [ 2.0, 0.0 ] ], "rank one")
+    end
+
+    it "keeps a part with no variance at no draw at all" do
+      # Row 2's 5 first: column (2 / sqrt 5, 0, sqrt 5). Row 0 is left with 3.2, row 1 with 0.
+      expect_root([ [ 4.0, 0.0, 2.0 ], [ 0.0, 0.0, 0.0 ], [ 2.0, 0.0, 5.0 ] ],
+                  [ [ 2.0 / Math.sqrt(5.0), Math.sqrt(3.2), 0.0 ], [ 0.0, 0.0, 0.0 ], [ Math.sqrt(5.0), 0.0, 0.0 ] ], "no variance")
+    end
+
+    it "answers empty, zero and one-entry matrices, Floats for Integers and Rationals, and leaves its input unchanged" do
+      matrix = [ [ 4, 2 ], [ Rational(2), 5 ] ].map(&:freeze).freeze
+
+      expect(cholesky.root([])).to eq([])
+      expect(cholesky.root([ [ 0.0 ] ])).to eq([ [ 0.0 ] ])
+      expect(cholesky.root([ [ 0.0, 0.0 ], [ 0.0, 0.0 ] ])).to eq([ [ 0.0, 0.0 ], [ 0.0, 0.0 ] ])
+      expect(cholesky.root([ [ 9.0 ] ])).to eq([ [ 3.0 ] ])
+      expect(cholesky.root(matrix).flatten).to all(be_a(Float))
+      expect(matrix).to eq([ [ 4, 2 ], [ 2, 5 ] ])
+    end
+
+    it "reads the matrix as factor reads it: the lower triangle, and the same refusals" do
+      expect(cholesky.root([ [ 1.0, 1e-17 ], [ -1e-17, 1.0 ] ])).to eq([ [ 1.0, 0.0 ], [ -1e-17, 1.0 ] ])
+      [
+        [ [ 1.0, 0.0 ] ], [ [ 1.0 ], [ 0.0, 1.0 ] ], [ [ 1.0, nil ], [ nil, 1.0 ] ], [ [ Float::NAN ] ], [ [ Float::INFINITY ] ],
+        [ [ 1.0, "0" ], [ "0", 1.0 ] ], [ 1.0 ], { 0 => [ 1.0 ] }, nil, [ [ 10**400 ] ], [ [ Complex(1, 0) ] ],
+        [ [ 1.0, 2e-12 ], [ 0.0, 1.0 ] ]
+      ].each do |matrix|
+        expect { cholesky.root(matrix) }.to raise_error(ArgumentError), matrix.inspect
+      end
+    end
+
+    it "refuses a rounding that is no finite number of at least 0" do
+      [ -1e-9, Float::NAN, Float::INFINITY, nil, "0", Complex(0, 0), 10**400 ].each do |bad|
+        expect { cholesky.root([ [ 1.0 ] ], rounding: bad) }.to raise_error(ArgumentError, /rounding/), bad.inspect
+      end
+      expect(cholesky.root([ [ 1.0 ] ], rounding: 0)).to eq([ [ 1.0 ] ])
+      expect(cholesky.root([ [ 1.0 ] ], rounding: Rational(1, 1000))).to eq([ [ 1.0 ] ])
+    end
+
+    it "refuses a matrix that is not positive semidefinite, by the message factor gives" do
+      expect { cholesky.root([ [ 1.0, 2.0 ], [ 2.0, 1.0 ] ]) }
+        .to raise_error(ArgumentError, /not positive semidefinite \(pivot -3\.0 in column 1\)/)
+      expect { cholesky.root([ [ -1.0 ] ]) }.to raise_error(ArgumentError, /not positive semidefinite \(pivot -1\.0 in column 0\)/)
+      {
+        "no variance that covaries" => [ [ 0.0, 1.0 ], [ 1.0, 0.0 ] ],
+        "the smallest covariance on a zero diagonal" => [ [ 0.0, 1e-300 ], [ 1e-300, 0.0 ] ],
+        # Row 0's 1 leaves rows 1 and 2 pivots of 0 with -1 between them.
+        "a zero pivot the first column made" => [ [ 1.0, 1.0, 1.0 ], [ 1.0, 1.0, 0.0 ], [ 1.0, 0.0, 1.0 ] ]
+      }.each do |label, matrix|
+        expect { cholesky.root(matrix) }.to raise_error(ArgumentError, /not positive semidefinite \(residual .* under the zero pivot/), label
+      end
+    end
+
+    it "refuses, by that message, a matrix whose elimination overflows" do
+      [
+        [ [ 1e-300, 1e300 ], [ 1e300, 1.0 ] ],
+        [ [ 1e-300, 1e300, 1e300 ], [ 1e300, 1.0, 0.5 ], [ 1e300, 0.5, 1.0 ] ]
+      ].each do |matrix|
+        [ 0.0, 1e-3 ].each do |rounding|
+          expect { cholesky.root(matrix, rounding: rounding) }
+            .to raise_error(ArgumentError, /not positive semidefinite/), "#{matrix.inspect} at #{rounding}"
+        end
+      end
+    end
+
+    it "reads a residual pivot within 1e-9 of the trace as zero, and one beyond it as a refusal or a pivot" do
+      expect_root([ [ 1.0, 0.0 ], [ 0.0, -1e-10 ] ], [ [ 1.0, 0.0 ], [ 0.0, 0.0 ] ], "negative within")
+      expect_root([ [ 1.0, 0.0 ], [ 0.0, 5e-10 ] ], [ [ 1.0, 0.0 ], [ 0.0, 0.0 ] ], "positive within")
+      expect_root([ [ 1.0, 0.0 ], [ 0.0, 2e-9 ] ], [ [ 1.0, 0.0 ], [ 0.0, Math.sqrt(2e-9) ] ], "positive beyond")
+      expect { cholesky.root([ [ 1.0, 0.0 ], [ 0.0, -1e-8 ] ]) }.to raise_error(ArgumentError, /pivot -1\.0e-08 in column 1/)
+    end
+
+    it "takes the larger of that and rounding, and a trace not above 0 gives none" do
+      expect_root([ [ 1.0, 0.0 ], [ 0.0, -1e-8 ] ], [ [ 1.0, 0.0 ], [ 0.0, 0.0 ] ], "within rounding", rounding: 1e-7)
+      expect { cholesky.root([ [ 1.0, 0.0 ], [ 0.0, -1e-6 ] ], rounding: 1e-7) }.to raise_error(ArgumentError, /pivot/)
+      expect { cholesky.root([ [ 0.0, 0.0 ], [ 0.0, -1e-20 ] ]) }.to raise_error(ArgumentError, /pivot -1\.0e-20 in column 1/)
+      expect_root([ [ 0.0, 0.0 ], [ 0.0, -1e-20 ] ], [ [ 0.0, 0.0 ], [ 0.0, 0.0 ] ], "no trace", rounding: 1e-19)
+    end
+
+    it "carries rounding to a residual through the multiples that made it" do
+      # Row 1 gives up 1 of row 0, so its reach is 2 and rounding on every entry moves its pivot by up to 4 * rounding:
+      # by hand, (1 - 2 r) + r + ... at each of the entries (1, 1), (1, 0) twice and (0, 0).
+      matrix = [ [ 1.0, 1.0 ], [ 1.0, 1.0 - 3e-7 ] ]
+
+      expect_root(matrix, [ [ 1.0, 0.0 ], [ 1.0, 0.0 ] ], "within 4 * rounding", rounding: 1e-7)
+      expect { cholesky.root(matrix, rounding: 5e-8) }.to raise_error(ArgumentError, /pivot/)
+      expect { cholesky.root(matrix) }.to raise_error(ArgumentError, /pivot/)
+
+      # Row 1 is left with a pivot of 0 and 1e-7 beside row 2, whose reach is 1: rounding * 2 * 1 may hold it.
+      beside = [ [ 1.0, 1.0, 0.0 ], [ 1.0, 1.0, 1e-7 ], [ 0.0, 1e-7, 0.0 ] ]
+      expect(cholesky.root(beside, rounding: 6e-8).map { |row| row[1..] }).to eq([ [ 0.0, 0.0 ], [ 0.0, 0.0 ], [ 0.0, 0.0 ] ])
+      expect { cholesky.root(beside, rounding: 4e-8) }.to raise_error(ArgumentError, /residual .* under the zero pivot/)
+    end
+
+    it "lets no indefinite matrix pass on its own multiples" do
+      # The pivot 1e-6 is above rounding, so it is kept and its multiple is 1e6. The reach of 1e6 gives a tolerance of
+      # about 1e-9 * 1e12 = 1e3, and the pivot left is about 1e-6 - 1e6.
+      expect { cholesky.root([ [ 1e-6, 1.0 ], [ 1.0, 1e-6 ] ], rounding: 1e-9) }.to raise_error(ArgumentError, /pivot/)
+      # A pivot within rounding is no divisor at all, and what stands beside it is more than it holds.
+      expect { cholesky.root([ [ 1e-9, 1.0 ], [ 1.0, 1e-9 ] ], rounding: 1e-9) }.to raise_error(ArgumentError, /residual/)
+    end
+
+    it "takes seeded Gram matrices of lower rank up to the largest size, each rebuilt, and refuses each made indefinite" do
+      rng = Random.new(20_261_031)
+      40.times do |trial|
+        size = [ 2, 12, 42, 84 ][trial % 4]
+        rank = 1 + rng.rand(size)
+        rows = Array.new(size) { Array.new(rank) { rng.rand - 0.5 } }
+        matrix = Array.new(size) { |i| Array.new(size) { |j| rows[i].zip(rows[j]).sum { |x, y| x * y } } }
+        matrix = Array.new(size) { |i| Array.new(size) { |j| i <= j ? matrix[i][j] : matrix[j][i] } }
+        largest = (0...size).map { |i| matrix[i][i] }.max
+        square = cholesky.root(matrix)
+
+        expect_rebuilt(square, matrix, 1e-12 * largest, "trial #{trial}")
+        expect((0...size).count { |column| square.any? { |row| !row[column].zero? } }).to be <= rank
+
+        first, second = (0...size).max_by(2) { |i| matrix[i][i] }
+        next if first.nil? || second.nil?
+
+        broken = matrix.map(&:dup)
+        broken[first][second] = broken[second][first] = 1.5 * Math.sqrt(matrix[first][first] * matrix[second][second])
+        expect { cholesky.root(broken) }.to raise_error(ArgumentError, /not positive semidefinite/), "trial #{trial}"
+      end
+    end
+  end
+
+  describe "rounding" do
+    # Factor refuses this one: the pivot 1e-13 is below the zero threshold and holds sqrt(1e-13 * 1) = 3.16e-7 plus its
+    # rounding of 1e-9, less than the 3.5e-7 under it. Root takes row 1's 1 first: column (3.5e-7, 1), and row 0 is left
+    # with 1e-13 - 1.225e-13, within 1e-9 of the trace. So z_p = m_p + 3.5e-7 * n_0 and z_q = m_q + n_0, and n_1 is drawn
+    # and read by neither.
+    let(:lower_rank) { [ [ 1e-13, 3.5e-7 ], [ 3.5e-7, 1.0 ] ] }
+
+    def one_arm(**overrides)
+      { arms: %i[a], parts: %i[p q], means: { a: [ 1.0, 2.0 ] }, covariance: lower_rank, parameters: { w: { fixed: 1.0 } },
+        weights: ->(_drawn) { { p: 1.0, q: 1.0 } } }.merge(overrides)
+    end
+
+    it "draws through the root where factor refuses, in the same draw order" do
+      expect { cholesky.factor(lower_rank) }.to raise_error(ArgumentError)
+      rng = Random.new(19)
+      rows = linear_value.each_draw(**one_arm, draws: 50, rng: rng).to_a
+      hand_rng = Random.new(19)
+      sampler = SkiftetStatistical::Sampler.new(hand_rng)
+      hand = Array.new(50) do
+        first = sampler.gaussian
+        sampler.gaussian
+        [ (1.0 + (3.5e-7 * first)) + (2.0 + first) ]
+      end
+
+      rows.zip(hand).each_with_index { |(row, expected), draw| expect_pin(row[0], expected[0], "draw #{draw}") }
+      expect(rng.rand).to eq(hand_rng.rand)
+    end
+
+    it "draws through the factor wherever it takes the covariance, bit for bit at any rounding" do
+      allow(cholesky).to receive(:root).and_call_original
+      plain = linear_value.each_draw(**inputs, draws: 40, rng: Random.new(8)).to_a
+
+      expect(linear_value.each_draw(**inputs, draws: 40, rng: Random.new(8), rounding: 1e-3).to_a).to eq(plain)
+      expect(linear_value.summary(**inputs, draws: 40, rng: Random.new(8), rounding: 1e-3))
+        .to eq(linear_value.summary(**inputs, draws: 40, rng: Random.new(8)))
+      expect(cholesky).not_to have_received(:root)
+    end
+
+    it "hands the root twice its rounding: an entry cleared under a bound may sit past it" do
+      allow(cholesky).to receive(:root).and_call_original
+      linear_value.summary(**one_arm, draws: 2, rng: Random.new(1), rounding: 1e-10)
+
+      expect(cholesky).to have_received(:root).with(lower_rank, rounding: 2e-10).once
+    end
+
+    it "still refuses a covariance neither takes, at any rounding within reason, before any random number" do
+      indefinite = one_arm(covariance: [ [ 1.0, 2.0 ], [ 2.0, 1.0 ] ])
+      noise = one_arm(covariance: [ [ 1.0, 1.0 ], [ 1.0, 1.0 - 1e-6 ] ])
+      rng = Random.new(31)
+
+      expect { linear_value.each_draw(**indefinite, draws: 3, rng: rng, rounding: 1e-9).to_a }.to raise_error(ArgumentError, /not positive semidefinite/)
+      expect { linear_value.summary(**indefinite, draws: 3, rng: rng, rounding: 1e-9) }.to raise_error(ArgumentError, /not positive semidefinite/)
+      expect { linear_value.each_draw(**noise, draws: 3, rng: rng).to_a }.to raise_error(ArgumentError, /not positive semidefinite/)
+      expect(linear_value.each_draw(**noise, draws: 3, rng: Random.new(1), rounding: 2e-7).to_a.size).to eq(3)
+      expect(rng.rand).to eq(Random.new(31).rand)
+    end
+
+    it "refuses a rounding that is no finite number of at least 0, even where the factor would not read it" do
+      [ -1e-9, Float::NAN, Float::INFINITY, nil, "0", Complex(0, 0), 10**400 ].each do |bad|
+        rng = Random.new(31)
+        expect { linear_value.each_draw(**inputs, draws: 3, rng: rng, rounding: bad).to_a }.to raise_error(ArgumentError, /rounding/), bad.inspect
+        expect { linear_value.summary(**inputs, draws: 3, rng: rng, rounding: bad) }.to raise_error(ArgumentError, /rounding/), bad.inspect
+        expect(rng.rand).to eq(Random.new(31).rand)
+      end
+    end
+  end
+
+  describe "a clip bound" do
+    it "SL18 refuses a bound finite as given that no Float holds, in either place, before any random number" do
+      [ 10**400, -(10**400), Rational(10**400, 3), Rational(-(10**400), 3) ].each do |bad|
+        [ [ bad, 1.0 ], [ 0.0, bad ] ].each do |bounds|
+          rng = Random.new(31)
+          spec = parameters.merge(lift: { normal: [ 0.5, 0.2 ], clip: bounds })
+
+          expect { linear_value.each_draw(**inputs(parameters: spec), draws: 3, rng: rng).to_a }
+            .to raise_error(ArgumentError, /clip/), bounds.inspect
+          expect(rng.rand).to eq(Random.new(31).rand)
+        end
+      end
+    end
+
+    it "SL18 takes an infinity as an infinity, and a huge bound a Float holds" do
+      unclipped = linear_value.each_draw(**inputs, draws: 20, rng: Random.new(4)).to_a
+
+      [ [ -Float::INFINITY, Float::INFINITY ], [ -1e308, 1e308 ], [ -(10**300), 10**300 ] ].each do |bounds|
+        spec = parameters.merge(lift: { normal: [ 0.5, 0.2 ], clip: bounds }, base: { fixed: 1.5, clip: bounds })
+        wide = { lift: { normal: [ 0.5, 0.2 ], clip: [ 0.0, 1.0 ] } }
+        rows = linear_value.each_draw(**inputs(parameters: spec.merge(wide)), draws: 20, rng: Random.new(4)).to_a
+
+        expect(rows).to eq(unclipped), bounds.inspect
       end
     end
   end

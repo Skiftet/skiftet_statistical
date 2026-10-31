@@ -85,6 +85,13 @@ jobs:
             lib/skiftet_statistical/cholesky.rb \
             lib/skiftet_statistical/linear_value.rb \
             lib/skiftet_statistical/hierarchical_rates.rb \
+            lib/skiftet_statistical/shared_credit.rb \
+            lib/skiftet_statistical/gauss_legendre.rb \
+            lib/skiftet_statistical/beta_argmax.rb \
+            lib/skiftet_statistical/beta_function.rb \
+            lib/skiftet_statistical/additive_contrasts.rb \
+            lib/skiftet_statistical/prequential.rb \
+            lib/skiftet_statistical/cusum.rb \
             spec/simulations \
             spec/pins \
             .github/workflows/ci.yml)

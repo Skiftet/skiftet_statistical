@@ -3,10 +3,12 @@
 module SkiftetStatistical
   # The regularized incomplete beta function I_x(alpha, beta), which is the Beta(alpha, beta) distribution
   # function, and its inverse, the Beta quantile. An exact credible interval on a conversion rate is two quantiles
-  # of its Beta posterior; computed this way it does not move when a Monte Carlo seed does.
+  # of its Beta posterior; computed this way it does not move when a Monte Carlo seed does. Beside them, the log of
+  # the Beta density.
   #
   #   SkiftetStatistical::BetaFunction.regularized(0.5, 2.0, 2.0)   # => 0.5
   #   SkiftetStatistical::BetaFunction.quantile(0.975, 41.0, 361.0) # => the 97.5 % bound of Beta(41, 361)
+  #   SkiftetStatistical::BetaFunction.log_density(0.25, 2.0, 3.0)  # => 0.5232481437645479 (log 27/16)
   #
   # The arithmetic and its order are part of the contract: with parameters in the hundreds or more the lgamma
   # terms of the front factor reach 1e3-1e5, so a reordered sum can move the result by 1e-12 to 1e-10.
@@ -49,7 +51,32 @@ module SkiftetStatistical
         (low + high) / 2.0
       end
 
+      # The log of the Beta(alpha, beta) density at x, for alpha, beta > 0:
+      #   lgamma(alpha + beta) - lgamma(alpha) - lgamma(beta) + (alpha - 1) log x + (beta - 1) log(1 - x)
+      # and -Float::INFINITY for x outside (0, 1). x, alpha and beta must be finite real numbers.
+      def log_density(x, alpha, beta)
+        x = finite(x, "x")
+        alpha = finite(alpha, "alpha")
+        beta = finite(beta, "beta")
+        unless alpha.positive? && beta.positive?
+          raise ArgumentError, "alpha and beta must be finite numbers > 0, got #{alpha}, #{beta}"
+        end
+        return -Float::INFINITY unless x > 0.0 && x < 1.0
+
+        Math.lgamma(alpha + beta)[0] - Math.lgamma(alpha)[0] - Math.lgamma(beta)[0] +
+          ((alpha - 1.0) * Math.log(x)) + ((beta - 1.0) * Math.log(1.0 - x))
+      end
+
       private
+
+      # A finite real number, as the newer modules read one (a NaN, an infinity, a Complex and a non-number are
+      # refused alike), and finite as a Float too (an Integer beyond a Float's range is not).
+      def finite(value, name)
+        number = value.to_f if value.is_a?(Numeric) && value.real? && value.finite?
+        return number if number&.finite?
+
+        raise ArgumentError, "#{name} must be a finite number, got #{value.inspect}"
+      end
 
       def number(value, name)
         value = value.to_f

@@ -20,6 +20,12 @@ require_relative "skiftet_statistical/bandit/win_hold"
 require_relative "skiftet_statistical/cholesky"
 require_relative "skiftet_statistical/linear_value"
 require_relative "skiftet_statistical/hierarchical_rates"
+require_relative "skiftet_statistical/shared_credit"
+require_relative "skiftet_statistical/gauss_legendre"
+require_relative "skiftet_statistical/beta_argmax"
+require_relative "skiftet_statistical/additive_contrasts"
+require_relative "skiftet_statistical/prequential"
+require_relative "skiftet_statistical/cusum"
 
 # Skiftet's shared statistics toolkit — a home for reusable, app-independent
 # statistical analysis code across the workspace.
