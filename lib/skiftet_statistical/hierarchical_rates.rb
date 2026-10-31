@@ -6,8 +6,9 @@ module SkiftetStatistical
   # strength k (Clayton and Kaldor 1987), so its posterior is Gamma(k + s, k + E). Under a two-groups prior (Efron 2008)
   # the node is null with probability 1 - h (its count Poisson(E), its ratio 1) and else drawn from that Gamma slab, so
   # its count is negative binomial NB(s; k, k / (k + E)). Beside the node rule: the leave-one-out share that sets E, the
-  # level fit of k (and h) by grid marginal maximum likelihood, the smoothing of a fitted value across runs, Marshall's
-  # (1991) moment estimate and the boundary likelihood-ratio test (Self and Liang 1987).
+  # level fit of k (and h) by grid marginal maximum likelihood, the leaf fit that estimates each parent's null rate
+  # jointly with k and h, the smoothing of a fitted value across runs, Marshall's (1991) moment estimate and the
+  # boundary likelihood-ratio test (Self and Liang 1987).
   #
   # Counts are real numbers >= 0 throughout, so a caller may count by share: a node that stands in its parent only by a
   # share w has w multiplied into its count and total by the caller (there is no weight keyword). The probability mass
@@ -28,6 +29,10 @@ module SkiftetStatistical
     # A pair whose parent has fewer children with data than this carries nothing about its level: the fit and both
     # checks leave it out.
     MINIMUM_SIBLINGS = 2
+    # The leaf fit takes at most this many steps on a parent's null rate ...
+    LEAF_STEPS = 50
+    # ... and stops at the first step that moves the rate by at most this share of itself.
+    LEAF_CHANGE = 1e-10
 
     class << self
       # The parent's share with the node's own count and total taken out, smoothed toward a prior share:
@@ -96,6 +101,60 @@ module SkiftetStatistical
           at_upper_bound: best_k == GRID.size - 1,
           interval: [ GRID[inside.min], GRID[inside.max] ],
           profile: GRID.each_with_index.map { |k, i| [ k, profile[i] ] }
+        }
+      end
+
+      # The leaf level's two-groups fit, each parent's NULL rate estimated jointly with k and h instead of read from a
+      # leave-one-out share. With few leaves to a parent (about five), a hot leaf lifts its siblings' leave-one-out
+      # share, so they read as cold, and a fit on those expected counts reads the hot share several times too high.
+      #
+      # parents: [[{ count:, total: }]], each parent's leaves, count a real number >= 0 and total the leaf's exposure,
+      # > 0; a leaf expects total * rate, rate its parent's null rate. At a strength k (grid: rising strengths, GRID
+      # by default) and a hot share h (hot_shares: each in [0, 1), since the rate is read from the leaves that may be
+      # null), every parent's rate starts at its pooled rate, sum count / sum total, and each step makes it
+      #   rate = sum w * count / sum w * total, w = the leaf's posterior probability of being null at the rate before,
+      # the null part of the mixture whose slab part is a node's hot. A parent stops at the first step that moves its
+      # rate by at most LEAF_CHANGE of itself (converged) or after LEAF_STEPS steps; parents share only k and h, so
+      # each is stepped on its own. A step whose sums give no rate, or a rate of 0 beside a count above 0 (which no
+      # rate of 0 explains), is not taken: the parent keeps its rate, not converged.
+      #
+      # The fit maximises fit_strength's marginal log-likelihood, over the leaves at their parents' rates, on grid
+      # times hot_shares; a tie goes to the larger strength, then to the hot share listed first. A parent with fewer
+      # than MINIMUM_SIBLINGS leaves is its own leaf's rate and carries nothing about the level: it is left out of
+      # the fit and answered at the fitted k and h. The answer, converged, rates and hot in the order given:
+      #   { strength:, hot_share:, log_likelihood:, at_upper_bound: (the strength is grid's last), converged: [whether
+      #     the parent's rate settled at the fitted point], rates: [rate], hot: [[posterior probability that the leaf
+      #     is hot]] }
+      # A leaf's hot is node's hot at count: count, expected: total * rate, strength: and hot_share:, bit for bit. A
+      # parent whose one leaf is near the line between null and hot can take hundreds of steps to settle: it answers
+      # its rate after LEAF_STEPS steps, and converged says so.
+      def fit_leaves(parents:, hot_shares:, grid: GRID)
+        groups = leaf_groups(parents)
+        strengths = strength_grid(grid)
+        hots = leaf_hot_shares(hot_shares)
+        kept = groups.select { |leaves| leaves.size >= MINIMUM_SIBLINGS }
+        raise ArgumentError, "no parent with #{MINIMUM_SIBLINGS} or more leaves" if kept.empty?
+
+        profiles = hots.map { [] }
+        strengths.each do |k|
+          level = with_strength(kept, k)
+          hots.each_with_index { |h, j| profiles[j] << leaf_level(level, k, h)[:log_likelihood] }
+        end
+
+        best_ll, best_k, best_j = best_point(profiles)
+        k = strengths[best_k]
+        h = hots[best_j]
+        fitted = leaf_level(with_strength(groups, k), k, h)
+        {
+          strength: k,
+          hot_share: h,
+          log_likelihood: best_ll,
+          at_upper_bound: best_k == strengths.size - 1,
+          converged: fitted[:converged],
+          rates: fitted[:rates],
+          hot: groups.zip(fitted[:rates]).map do |leaves, rate|
+            leaves.map { |s, t| hot_probability(s, t * rate, k, h) }
+          end
         }
       end
 
@@ -175,7 +234,12 @@ module SkiftetStatistical
 
       # log NB(s; k, k / (k + E)) = lgamma(s + k) - lgamma(k) - lgamma(s + 1) + k log(k / (k + E)) + s log(E / (k + E)).
       def log_slab(s, e, k, log_gamma_k, log_factorial)
-        Math.lgamma(s + k)[0] - log_gamma_k - log_factorial + (k * Math.log(k / (k + e))) + x_log_y(s, e / (k + e))
+        log_slab_from(Math.lgamma(s + k)[0], s, e, k, log_gamma_k, log_factorial)
+      end
+
+      # log_slab with lgamma(s + k) given, in the same order.
+      def log_slab_from(log_gamma_sk, s, e, k, log_gamma_k, log_factorial)
+        log_gamma_sk - log_gamma_k - log_factorial + (k * Math.log(k / (k + e))) + x_log_y(s, e / (k + e))
       end
 
       # log Poisson(s; E) = s log E - E - lgamma(s + 1).
@@ -231,11 +295,119 @@ module SkiftetStatistical
         best
       end
 
-      def hot_shares(hot_grid)
-        hots = hot_grid.map { |h| share(h, "each hot_grid value") }
-        raise ArgumentError, "hot_grid must hold at least one hot share" if hots.empty?
+      def hot_shares(hot_grid, name = "hot_grid")
+        hots = hot_grid.map { |h| share(h, "each #{name} value") }
+        raise ArgumentError, "#{name} must hold at least one hot share" if hots.empty?
 
         hots
+      end
+
+      # The leaf fit's hot shares, each below 1: the null rate is read from the leaves that may be null.
+      def leaf_hot_shares(values)
+        raise ArgumentError, "hot_shares must be an Array, got #{values.inspect}" unless values.is_a?(Array)
+
+        hots = hot_shares(values, "hot_shares")
+        raise ArgumentError, "each hot_shares value must be below 1, got #{values.inspect}" if hots.include?(1.0)
+
+        hots
+      end
+
+      def strength_grid(grid)
+        unless grid.is_a?(Array) && !grid.empty?
+          raise ArgumentError, "grid must be an Array of at least one strength, got #{grid.inspect}"
+        end
+
+        strengths = grid.map { |k| positive(k, "each grid strength") }
+        raise ArgumentError, "grid must rise strictly, got #{grid.inspect}" unless strengths.each_cons(2).all? { |a, b| a < b }
+
+        strengths
+      end
+
+      # Every parent's leaves checked: [[[s, t, lgamma(s + 1)]]].
+      def leaf_groups(parents)
+        raise ArgumentError, "parents must be an Array of parents, got #{parents.inspect}" unless parents.is_a?(Array)
+
+        parents.map do |leaves|
+          unless leaves.is_a?(Array) && !leaves.empty?
+            raise ArgumentError, "each parent must be an Array of at least one leaf, got #{leaves.inspect}"
+          end
+
+          leaves.map do |leaf|
+            raise ArgumentError, "each leaf must be a Hash of count: and total:, got #{leaf.inspect}" unless leaf.is_a?(Hash)
+
+            s = nonnegative(leaf.fetch(:count) { raise ArgumentError, "each leaf needs count:" }, "count")
+            t = positive(leaf.fetch(:total) { raise ArgumentError, "each leaf needs total:" }, "total")
+            [ s, t, Math.lgamma(s + 1.0)[0] ]
+          end
+        end
+      end
+
+      # The parents at strength k, each [pooled rate, any count above 0, leaves], a leaf [s, t, lgamma(s + 1),
+      # lgamma(s + k), lgamma(s + k) - lgamma(k) + k log k].
+      def with_strength(groups, k)
+        base = (k * Math.log(k)) - Math.lgamma(k)[0]
+        groups.map do |leaves|
+          parent = leaves.map do |s, t, log_factorial|
+            log_gamma_sk = Math.lgamma(s + k)[0]
+            [ s, t, log_factorial, log_gamma_sk, log_gamma_sk + base ]
+          end
+          [ pooled_rate(leaves), leaves.any? { |s, _t| s.positive? }, parent ]
+        end
+      end
+
+      # Every parent's null rate at strength k and hot share h, whether it settled, and the log-likelihood of their
+      # leaves at those rates (fit_strength's terms, in the same order).
+      def leaf_level(level, k, h)
+        log_gamma_k = Math.lgamma(k)[0]
+        odds = h.zero? ? nil : Math.log(h) - Math.log(1.0 - h)
+        converged = []
+        terms = []
+        rates = level.map do |pooled, counted, leaves|
+          rate, settled = odds.nil? || !counted || leaves.size == 1 ? [ pooled, true ] : null_rate(pooled, leaves, k, odds)
+          converged << settled
+          leaves.each do |s, t, log_factorial, log_gamma_sk|
+            e = t * rate
+            terms << [ log_slab_from(log_gamma_sk, s, e, k, log_gamma_k, log_factorial), log_null(s, e, log_factorial) ]
+          end
+          rate
+        end
+        { rates: rates, converged: converged, log_likelihood: log_likelihood(terms, h) }
+      end
+
+      # One parent's null rate (fit_leaves) from its pooled rate, at log odds log(h / (1 - h)) with 0 < h < 1 and a
+      # count above 0: [rate, converged]. A leaf's weight is its posterior probability of being null, 1 / (1 +
+      # exp(d)), d the log odds of slab to null, log(h / (1 - h)) + lgamma(s + k) - lgamma(k) + k log k + E - (k + s)
+      # log(k + E), the two parts' lgamma(s + 1) and s log E cancelling. (At h = 0 every weight is 1, with no count
+      # every rate is 0, and a lone leaf's weight cancels, so in each case the pooled rate is its own next step.)
+      def null_rate(rate, leaves, k, odds)
+        LEAF_STEPS.times do
+          count = 0.0
+          total = 0.0
+          leaves.each do |s, t, _log_factorial, _log_gamma_sk, base|
+            e = t * rate
+            w = 1.0 / (1.0 + Math.exp(odds + base + e - ((k + s) * Math.log(k + e))))
+            count += w * s
+            total += w * t
+          end
+          following = count / total
+          return [ rate, false ] unless following.finite? && following.positive?
+
+          settled = (following - rate).abs <= LEAF_CHANGE * rate
+          rate = following
+          return [ rate, true ] if settled
+        end
+        [ rate, false ]
+      end
+
+      # sum s / sum t over a parent's leaves, summed in order: every weight 1.
+      def pooled_rate(leaves)
+        count = 0.0
+        total = 0.0
+        leaves.each do |s, t|
+          count += s
+          total += t
+        end
+        count / total
       end
 
       def observable(s, e)

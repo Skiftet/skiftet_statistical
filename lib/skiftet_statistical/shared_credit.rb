@@ -50,6 +50,9 @@ module SkiftetStatistical
   # `LinearValue.summary(..., rounding: estimate.rounding)`, so a covariance answered on valid rows is not refused for
   # its own rounding.
   #
+  # `contrast` gives one difference with its plug-in variance; `contrast_for_fit` gives it with one per-visit variance
+  # pooled over the two arms, for a fit that pools contrasts across cells, and leaves out an arm of a small Kish's size.
+  #
   # An estimate is a Hash of exactly those four keys that also names its parts (Estimate#parts) and its rounding
   # (Estimate#rounding), so `linear` and `contrast` read a Hash of weights by name. Read back from JSON it is a plain
   # Hash, which holds neither.
@@ -140,7 +143,65 @@ module SkiftetStatistical
         { mean: Read.result(mean_first - mean_second), variance: variance.negative? ? 0.0 : variance }
       end
 
+      # One difference V_arm - V_reference at fixed weights (as `linear` reads them), for a fit that pools contrasts
+      # across cells, with the null-homoscedastic sandwich variance: one per-visit variance of the weighted part value,
+      # pooled over both arms, times each arm's sum of squared normalised weights. `contrast` stays as it is.
+      #
+      # Why: an arm held at a small floor share has a small Kish's size, and its plug-in variance moves with its own
+      # estimate (a rare 0/1 part that the arm has not yet seen reads a variance near 0), so `contrast`'s z is too wide
+      # under an adaptive allocation, and a test across cells rejects too often. Pooled, the per-visit variance comes
+      # mostly from the larger arm, and the small arm's estimate barely moves it.
+      #
+      # With u_ai = w_ai / W_a, the sandwich variance of V_a is v_a = sum_i u_ai^2 * (y_i - V_a)^2, y_i = sum_p
+      # weight_p * x_ip, and sum_i u_ai^2 = 1 / n_a, n_a Kish's size (the estimate's `effective`). So the arm's per-visit variance is
+      # s_a^2 = v_a * n_a, the pooled one s^2 = (n_a * s_a^2 + n_r * s_r^2) / (n_a + n_r), each arm weighing as its
+      # Kish's size, and the variance s^2 * (1 / n_a + 1 / n_r). Where the two per-visit variances agree it is `contrast`'s.
+      #
+      # Answers { mean:, variance: }, or nil when either arm has nil means or a Kish's size under `minimum_effective`
+      # (a finite number at least 0): that contrast is then left out of the fit. An arm against itself answers
+      # { mean: 0.0, variance: 0.0 }, as the sandwich s^2 * sum_i (u_ai - u_ai)^2 says. The estimate holds no sum of the
+      # credit two arms share, so rows that credit both are read as if apart: the sandwich's term -2 * s^2 * sum_i u_ai *
+      # u_ri, which only lowers the variance (a shared row moves both arms alike), is left out. The estimate needs
+      # `effective` beside its means and covariance (every estimate this module answers has it, read back from JSON
+      # too). A variance that overflows raises.
+      def contrast_for_fit(estimate, arm, reference, weights:, minimum_effective: 20)
+        minimum = Read.weight(minimum_effective, "minimum_effective")
+        linear = linear(estimate, weights: weights)
+        names = linear[:means].keys
+        i = arm_index(names, arm)
+        j = arm_index(names, reference)
+        sizes = read_effective(estimate, names)
+        mean_arm = linear[:means][names[i]]
+        mean_reference = linear[:means][names[j]]
+        return nil if mean_arm.nil? || mean_reference.nil?
+
+        size_arm = sizes[i]
+        size_reference = sizes[j]
+        return nil if size_arm < minimum || size_reference < minimum || !size_arm.positive? || !size_reference.positive?
+        return { mean: 0.0, variance: 0.0 } if i == j
+
+        covariance = linear[:covariance]
+        per_visit_arm = covariance[i][i] * size_arm
+        per_visit_reference = covariance[j][j] * size_reference
+        pooled = Read.result(((size_arm * per_visit_arm) + (size_reference * per_visit_reference)) / (size_arm + size_reference))
+        variance = Read.result(pooled * ((1.0 / size_arm) + (1.0 / size_reference)))
+        { mean: Read.result(mean_arm - mean_reference), variance: variance }
+      end
+
       private
+
+      # Kish's size per arm of an estimate, in the order of `names` (its means' arms), read by Symbol or String: every
+      # arm once, nothing else, each a finite number at least 0.
+      def read_effective(estimate, names)
+        effective = Read.lookup(estimate, :effective) { raise ArgumentError, "the estimate has no effective sizes" }
+        raise ArgumentError, "the estimate's effective sizes must be a Hash of arm => size, got #{effective.class}" unless effective.is_a?(Hash)
+
+        given = Read.keyed(effective, names.each_with_index.to_h { |name, index| [ name.to_s, index ] }, "the estimate's effective sizes").to_h
+        names.each_with_index.map do |name, index|
+          value = given.fetch(index) { raise ArgumentError, "the estimate has no effective size for arm #{name.inspect}" }
+          Read.weight(value, "the effective size of arm #{name.inspect}")
+        end
+      end
 
       # [arms, rates (nil or P Floats per arm), covariance (Floats), P] of an estimate's means and covariance (read by
       # Symbol or String key; its other keys are not read).

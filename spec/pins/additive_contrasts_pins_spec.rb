@@ -2,14 +2,19 @@
 
 # SL9: the pooling reaches the decision. Pooling runs per (arm, part): `fit`'s `arms:` name the pairs, one `.baseline`
 # runs per part, and `.pooled_estimate` answers a cell's SharedCredit-shaped estimate, theta(a | cell) = mu(cell) +
-# delta(a | cell), the reference arm's delta 0. Per entry (a, p):
+# delta(a | cell), the reference arm's delta 0 and the level mu one quantity every arm with credit shares. Per entries
+# (a, p) and (b, q):
 #
-#   means[a][p]              = mu_p(cell) + delta_ap(cell)
-#   sd_pooled(a, p)^2        = Var(mu_p) + Var(delta_ap), the reference arm's Var(mu_p) alone
-#   cov[(a, p), (b, q)]      = rho_own[(a, p), (b, q)] * sd_pooled(a, p) * sd_pooled(b, q)
+#   means[a][p]             = mu_p(cell) + delta_ap(cell)
+#   cov[(a, p), (b, q)]     = Cov(mu_p, mu_q) + [a == b] * Cov(delta_ap, delta_aq)
+#   Cov(mu_p, mu_q)         = rho_ref(p, q) * sd(mu_p) * sd(mu_q), Var(mu_p) at p == q
+#   Cov(delta_ap, delta_aq) = rho_a(p, q) * sd(delta_ap) * sd(delta_aq), Var(delta_ap) at p == q
 #
-# rho_own from `own`'s covariance, 0 off the diagonal where an own variance is 0. Every expected value below is worked by
-# hand from these formulas alone, in Rationals, in the comment above it, and compared to 1e-12.
+# rho_ref and rho_a are `own`'s correlations between the parts of the reference arm and of arm a, 0 beside an own
+# variance of 0; nothing between two arms is read from `own`. Beside each variance `fit` answers its test of no
+# variation (#variation_tests): Q, the moment's spread sum P * (estimate - mean)^2, on its degrees, and p = P(chi-squared
+# >= Q). Every expected value below is worked by hand from these formulas alone, in Rationals (a p value by a closed
+# chi-squared tail: exp(-Q / 2) on 2 degrees, erfc(sqrt(Q / 2)) on 1), in the comment above it, and compared to 1e-12.
 RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
   def contrasts = SkiftetStatistical::AdditiveContrasts
 
@@ -59,12 +64,12 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
   # 3/200, (1, 2) 9/800, (1, 3) 3/200, (2, 3) 3/100.
   # Its contrasts of a against ref: 8/5 - 1 = 3/5 at variance 9/100 + 1/25 - 2 * 9/200 = 1/25, and 4/5 - 1/2 = 3/10 at
   # variance 1/25 + 1/100 - 2 * 3/200 = 1/50.
-  def own_one
+  def own_one(rounding = 0.0)
     estimate(%i[p q], { ref: [ rational(1), rational(1, 2) ], a: [ rational(8, 5), rational(4, 5) ] },
              [ [ rational(1, 25), rational(1, 100), rational(9, 200), rational(3, 200) ],
                [ rational(1, 100), rational(1, 100), rational(9, 800), rational(3, 200) ],
                [ rational(9, 200), rational(9, 800), rational(9, 100), rational(3, 100) ],
-               [ rational(3, 200), rational(3, 200), rational(3, 100), rational(1, 25) ] ])
+               [ rational(3, 200), rational(3, 200), rational(3, 100), rational(1, 25) ] ], rounding)
   end
 
   # c2's own sds are 3/25, 1/10, 4/25, 1/10, no correlation across arms, 1/2 across the parts of an arm: (0, 1) 1/2 *
@@ -87,6 +92,16 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
     [ node("c1", { pair_p => [ 0.6, 0.04 ], pair_q => [ 0.3, 0.02 ] }),
       node("c2", { pair_p => [ 0.2, 0.04 ], pair_q => [ 0.3, 0.02 ] }) ]
   end
+
+  # Effects handed for c1 and c2, each delta's sd a round number: c1's (a, p) [1/2, 9/100] (sd 3/10) and (a, q) [3/10,
+  # 1/25] (sd 1/5); c2's (a, p) [3/10, 1/25] (sd 1/5) and (a, q) [3/10, 1/100] (sd 1/10).
+  def round_effects
+    { "c1" => { pair_p => [ 0.5, 0.09 ], pair_q => [ 0.3, 0.04 ] },
+      "c2" => { pair_p => [ 0.3, 0.04 ], pair_q => [ 0.3, 0.01 ] } }
+  end
+
+  # A standard normal from two uniforms (Box and Muller).
+  def standard_normal(rng) = Math.sqrt(-2.0 * Math.log(1.0 - rng.rand)) * Math.cos(2.0 * Math::PI * rng.rand)
 
   describe ".pair" do
     it "SL9 names a pair by its arm and its part, the name fit's arms: and an answer's effects carry" do
@@ -144,6 +159,96 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
     end
   end
 
+  describe ".fit's test of no variation" do
+    def expect_test(answer, name, arm, statistic, degrees, p_value)
+      test = answer.variation_tests.dig(name, arm)
+      expect(test.keys).to eq(%i[statistic degrees p_value])
+      expect_close(test[:statistic], statistic, "#{name} #{arm}: Q")
+      expect(test[:degrees]).to eq(degrees)
+      expect_close(test[:p_value], p_value, "#{name} #{arm}: p")
+    end
+
+    # Four cells under one leaf n, with variance 1 each, crossed with g: x holds the estimates 0 and 2, y holds 3 and 3.
+    def crossed
+      [ [ 1, 0.0, "x" ], [ 2, 2.0, "x" ], [ 3, 3.0, "y" ], [ 4, 3.0, "y" ] ].map do |id, estimate, key|
+        { id: id, contrasts: { a: [ estimate, 1.0 ] }, tree: %i[root n], groups: { "g" => key } }
+      end
+    end
+
+    it "SL9 answers beside each variance Q, its degrees and Q's chi-squared tail, and keeps its three keys" do
+      # a|p: the spread is 25 * (1/5)^2 * 2 = 2 (the moment of the worked posteriors above) on 2 - 1 = 1 degree, so
+      # p = P(chi-squared(1) >= 2) = P(|Z| >= sqrt(2)) = erfc(1). a|q: equal estimates, spread 0, p = 1.
+      answer = contrasts.fit(cells: two_cells, arms: [ pair_p, pair_q ])
+
+      expect(answer.keys).to eq(%i[variances effects cells])
+      expect(answer.variation_tests.keys).to eq([ "tree:1" ])
+      expect(answer.variation_tests["tree:1"].keys).to eq([ pair_p, pair_q ])
+      expect_test(answer, "tree:1", pair_p, 2, 1, Math.erfc(1.0))
+      expect_test(answer, "tree:1", pair_q, 0, 1, 1)
+    end
+
+    it "SL9 tests each depth on its nodes' own sampling variances, the depth under them carried" do
+      # m1 > l1 (0), l2 (4); m2 > l3 (1), l4 (1); variance 1 each.
+      # tree:2: around 2, 1 * 2^2 + 1 * 2^2 = 8; around 1, 0. Q = 8 on 1 + 1 = 2 degrees, p = exp(-8/2) = exp(-4); scale
+      # (2 - 2/2) * 2 = 2, so tau^2 = (8 - 2) / 2 = 3.
+      # Each leaf then sends precision 1 / (1 + 3 * 1) = 1/4 with sums 0, 1, 1/4, 1/4: m1 holds 1/2 and 1 (estimate 2),
+      # m2 1/2 and 1/2 (estimate 1). tree:1: around 3/2, 1/2 * (1/2)^2 * 2 = 1/4 on 1 degree, p = P(|Z| >= 1/2) =
+      # erfc(sqrt(1/8)); scale 1 - (1/4 + 1/4) / 1 = 1/2, tau^2 = max(0, (1/4 - 1) / (1/2)) = 0.
+      cells = [ [ :m1, :l1, 0.0 ], [ :m1, :l2, 4.0 ], [ :m2, :l3, 1.0 ], [ :m2, :l4, 1.0 ] ].map do |middle, leaf, estimate|
+        { id: leaf, contrasts: { a: [ estimate, 1.0 ] }, tree: [ :root, middle, leaf ], groups: {} }
+      end
+      answer = contrasts.fit(cells: cells, arms: %i[a])
+
+      expect_test(answer, "tree:2", :a, 8, 2, Math.exp(-4.0))
+      expect_test(answer, "tree:1", :a, rational(1, 4), 1, Math.erfc(Math.sqrt(0.125)))
+      expect_close(answer.dig(:variances, "tree:2", :a), 3, "tree:2's variance")
+      expect(answer.dig(:variances, "tree:1", :a)).to eq(0.0)
+    end
+
+    it "SL9 tests a crossed grouping on its keys, and a level of one node on no degrees at p 1" do
+      # The tree reads the weighted mean 8/4 = 2, so g's keys hold x: -2 + 0 = -2 over precision 2 (estimate -1), y: 1 +
+      # 1 = 2 over 2 (estimate 1). Around 0: 2 * 1 + 2 * 1 = 4 on 1 degree, p = P(|Z| >= 2) = erfc(sqrt(2)); scale 4 - 8/4
+      # = 2, tau^2 = (4 - 1) / 2 = 3/2. The keys' means -3/4 and 3/4 cancel in the leaf, which stays at 2, so every sweep
+      # reads the same Q. tree:1 holds n alone: no spread, no degrees, p 1.
+      answer = contrasts.fit(cells: crossed, arms: %i[a])
+
+      expect_test(answer, "g", :a, 4, 1, Math.erfc(Math.sqrt(2.0)))
+      expect_test(answer, "tree:1", :a, 0, 0, 1)
+      expect_close(answer.dig(:variances, "g", :a), rational(3, 2), "g's variance")
+    end
+
+    it "SL9 tests a variance held in variances: on the data all the same, and none it names that the cells do not" do
+      # g held at 0: its keys' means are 0, the leaf reads 8/4 = 2 as before, so g's keys hold the same -2 and 2: Q = 4.
+      # "other" is no grouping of these cells: it stays in variances, untested.
+      answer = contrasts.fit(cells: crossed, arms: %i[a], variances: { "g" => { a: 0.0 }, "other" => { a: 1.0 } })
+
+      expect(answer.dig(:variances, "g", :a)).to eq(0.0)
+      expect(answer.dig(:variances, "other", :a)).to eq(1.0)
+      expect_test(answer, "g", :a, 4, 1, Math.erfc(Math.sqrt(2.0)))
+      expect(answer.variation_tests.keys).to contain_exactly("tree:1", "g")
+    end
+
+    it "SL9 rejects at 5 % about one fit in twenty where nothing varies, whatever the sampling variances" do
+      # Twenty nodes at truth 0, sampling variances 1/2 to 2: Q is chi-squared on 19 degrees, so p is uniform and about
+      # 5 % of 400 fits (20, sd about 4.4) fall below 0.05. With a true tau^2 of 1 most fits reject.
+      rng = Random.new(31)
+      shares = [ 0.0, 1.0 ].map do |tau_squared|
+        rejected = Array.new(400) do
+          cells = Array.new(20) do |index|
+            variance = 0.5 + (1.5 * rng.rand)
+            truth = Math.sqrt(tau_squared) * standard_normal(rng)
+            node("n#{index}", { a: [ truth + (Math.sqrt(variance) * standard_normal(rng)), variance ] })
+          end
+          contrasts.fit(cells: cells, arms: %i[a]).variation_tests.dig("tree:1", :a, :p_value) < 0.05
+        end
+        rejected.count(true) / 400.0
+      end
+
+      expect(shares.first).to be_between(0.02, 0.09)
+      expect(shares.last).to be > 0.5
+    end
+  end
+
   describe ".baseline with an arm left out of fit's arms:" do
     # Rows of one visit: c1 ref k1, c1 a k2, c1 b k1, c2 ref k2; b left out of `fit`, so named at [0.0, 0.0].
     let(:rows) do
@@ -179,8 +284,7 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
   describe ".pooled_estimate" do
     let(:effects) { contrasts.fit(cells: two_cells, arms: [ pair_p, pair_q ])[:cells] }
 
-    # p's baseline variance 1/100 beside delta's 3/100 makes sds of 1/10 and 1/5; q's 9/1600 beside 1/100 makes 3/40 and
-    # 1/8, by the triple (3/40)^2 + (4/40)^2 = (5/40)^2.
+    # The levels' sds: p's 1/10 (variance 1/100) and q's 3/40 (variance 9/1600), in both cells.
     let(:baselines) do
       { p: { "c1" => [ 1.1, 0.01 ], "c2" => [ 1.9, 0.01 ] }, q: { "c1" => [ 0.6, 9.0 / 1600 ], "c2" => [ 1.2, 9.0 / 1600 ] } }
     end
@@ -189,31 +293,65 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
       contrasts.pooled_estimate(own: own, effects: effects_given, baselines: baselines_given, cell: cell)
     end
 
-    it "SL9 answers the worked estimate of c1: two arms, two parts" do
+    it "SL9 answers the worked estimate of c1: two arms, two parts, the level shared by both" do
       # Means: ref mu = 11/10, 3/5. a mu + delta = 11/10 + 1/2 = 8/5, 3/5 + 3/10 = 9/10.
-      # sds: (ref, p) 1/10, (ref, q) 3/40, (a, p) sqrt(1/100 + 3/100) = 1/5, (a, q) sqrt(9/1600 + 16/1600) = 1/8.
-      # Each entry its own correlation times two sds:
-      # (0, 1) 1/2 * 1/10 * 3/40 = 3/800. (0, 2) 3/4 * 1/10 * 1/5 = 3/200. (0, 3) 3/8 * 1/10 * 1/8 = 3/640.
-      # (1, 2) 3/8 * 3/40 * 1/5 = 9/1600. (1, 3) 3/4 * 3/40 * 1/8 = 9/1280. (2, 3) 1/2 * 1/5 * 1/8 = 1/80.
-      answer = pooled(own_one, "c1")
+      # own_one's correlation between parts is 1/2 in each arm; its correlations across the arms (3/4, 3/8) are not read.
+      # Cov(mu_p, mu_q) = 1/2 * 1/10 * 3/40 = 3/800. Cov(delta_ap, delta_aq) = 1/2 * 3/10 * 1/5 = 3/100.
+      # (0, 0) 1/100, (1, 1) 9/1600, (2, 2) 1/100 + 9/100 = 1/10, (3, 3) 9/1600 + 64/1600 = 73/1600.
+      # (0, 2) Var(mu_p) = 1/100, (1, 3) Var(mu_q) = 9/1600, (0, 1) = (0, 3) = (1, 2) = 3/800, (2, 3) 3/800 + 3/100 =
+      # 27/800. The contrast of a and ref at p: 1/10 + 1/100 - 2 * 1/100 = 9/100, delta_ap's variance alone.
+      answer = pooled(own_one, "c1", effects_given: round_effects)
 
       expect_means(answer, { ref: [ rational(11, 10), rational(3, 5) ], a: [ rational(8, 5), rational(9, 10) ] })
-      expect_covariance(answer, [ [ rational(1, 100), rational(3, 800), rational(3, 200), rational(3, 640) ],
-                                  [ rational(3, 800), rational(9, 1600), rational(9, 1600), rational(9, 1280) ],
-                                  [ rational(3, 200), rational(9, 1600), rational(1, 25), rational(1, 80) ],
-                                  [ rational(3, 640), rational(9, 1280), rational(1, 80), rational(1, 64) ] ])
+      expect_covariance(answer, [ [ rational(1, 100), rational(3, 800), rational(1, 100), rational(3, 800) ],
+                                  [ rational(3, 800), rational(9, 1600), rational(3, 800), rational(9, 1600) ],
+                                  [ rational(1, 100), rational(3, 800), rational(1, 10), rational(27, 800) ],
+                                  [ rational(3, 800), rational(9, 1600), rational(27, 800), rational(73, 1600) ] ])
+      expect_close(shared_credit.contrast(answer, :a, :ref, weights: [ 1.0, 0.0 ])[:variance], rational(9, 100),
+                   "the contrast's variance")
     end
 
-    it "SL9 answers the worked estimate of c2, whose effect for p differs and whose arms do not covary" do
-      # Means: ref 19/10, 6/5. a 19/10 + 3/10 = 11/5, 6/5 + 3/10 = 3/2. The same sds as c1's.
-      # (0, 1) 1/2 * 1/10 * 3/40 = 3/800. (2, 3) 1/2 * 1/5 * 1/8 = 1/80. Across arms own correlation 0.
-      answer = pooled(own_two, "c2")
+    it "SL9 answers the worked estimate of c2, whose own arms do not covary and whose pooled ones do, by the level" do
+      # Means: ref 19/10, 6/5. a 19/10 + 3/10 = 11/5, 6/5 + 3/10 = 3/2.
+      # own_two's correlation between parts: ref 3/500 / (3/25 * 1/10) = 1/2, a 1/125 / (4/25 * 1/10) = 1/2.
+      # Cov(mu_p, mu_q) = 1/2 * 1/10 * 3/40 = 3/800. Cov(delta_ap, delta_aq) = 1/2 * 1/5 * 1/10 = 1/100.
+      # (0, 0) 1/100, (1, 1) 9/1600, (2, 2) 1/100 + 1/25 = 1/20, (3, 3) 9/1600 + 16/1600 = 1/64.
+      # (0, 2) 1/100, (1, 3) 9/1600, (0, 1) = (0, 3) = (1, 2) = 3/800, (2, 3) 3/800 + 1/100 = 11/800.
+      answer = pooled(own_two, "c2", effects_given: round_effects)
 
       expect_means(answer, { ref: [ rational(19, 10), rational(6, 5) ], a: [ rational(11, 5), rational(3, 2) ] })
-      expect_covariance(answer, [ [ rational(1, 100), rational(3, 800), 0, 0 ],
-                                  [ rational(3, 800), rational(9, 1600), 0, 0 ],
-                                  [ 0, 0, rational(1, 25), rational(1, 80) ],
-                                  [ 0, 0, rational(1, 80), rational(1, 64) ] ])
+      expect_covariance(answer, [ [ rational(1, 100), rational(3, 800), rational(1, 100), rational(3, 800) ],
+                                  [ rational(3, 800), rational(9, 1600), rational(3, 800), rational(9, 1600) ],
+                                  [ rational(1, 100), rational(3, 800), rational(1, 20), rational(11, 800) ],
+                                  [ rational(3, 800), rational(9, 1600), rational(11, 800), rational(1, 64) ] ])
+    end
+
+    it "SL9 reads nothing between two arms from own: own_one and own_two, alike within each arm, answer alike" do
+      # Their correlations between parts are 1/2 in every arm; across the arms own_one's are 3/4 and 3/8, own_two's 0.
+      # Only the levels, the effects and those within-arm correlations reach the answer, so c1's is the same on either.
+      one = pooled(own_one, "c1", effects_given: round_effects)
+      two = pooled(own_two, "c1", effects_given: round_effects)
+
+      expect_means(two, one[:means])
+      expect_covariance(two, one[:covariance])
+    end
+
+    it "SL9 lets no share follow the level: an arm's P(best) is the same at a level's variance of 1/10000 and of 4" do
+      # One part, no shared credit. The entries are [[v, v], [v, v + 1/100]], so a draw of a - ref is delta's alone,
+      # N(1/10, 1/100): P(best) of a is Phi(1), about 0.8413, whatever v; the same draws give the same share.
+      own = estimate(%i[p], { ref: [ 1.0 ], a: [ 1.1 ] }, [ [ 0.04, 0.0 ], [ 0.0, 0.04 ] ])
+      shares = [ 1e-4, 4.0 ].map do |variance|
+        answer = pooled(own, "c1", effects_given: { "c1" => { contrasts.pair(:a, :p) => [ 0.1, 0.01 ] } },
+                                   baselines_given: { p: { "c1" => [ 1.0, variance ] } })
+        SkiftetStatistical::LinearValue.summary(
+          arms: %i[ref a], parts: %i[p], means: answer[:means], covariance: answer[:covariance],
+          parameters: { base: { fixed: 1.0 } }, weights: ->(drawn) { { p: drawn.fetch(:base) } }, draws: 2_000,
+          rng: Random.new(5), rounding: answer.rounding
+        )[:a][:p_best]
+      end
+
+      expect_close(shares.last, shares.first, "a's P(best) at a level's variance of 4")
+      expect(shares.first).to be_within(0.03).of(SkiftetStatistical::Significance.normal_cdf(1.0))
     end
 
     it "SL9 runs the three doors end to end: fit over the pairs, one baseline per part, the estimate" do
@@ -223,7 +361,9 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
       # Part q, e = 3/10 in both. c1: ref 2/5, a 1 moved to 7/10: mu = 11/20, each visit 3/20 off: (2 * 4 * 9/400) / 16 =
       # 9/800. c2: ref 4/5, a 8/5 moved to 13/10: mu = 21/20, each visit 1/4 off: (2 * 4 * 1/16) / 16 = 1/32.
       # c1's estimate: means ref 21/20, 11/20; a 21/20 + 1/2 = 31/20, 11/20 + 3/10 = 17/20. Variances 1/800, 9/800,
-      # 1/800 + 3/100 = 1/32, 9/800 + 1/100 = 17/800. (0, 2) 3/4 * sqrt(1/800 * 25/800) = 3/4 * 5/800 = 3/640.
+      # 1/800 + 3/100 = 1/32, 9/800 + 1/100 = 17/800. Across the arms the level alone: (0, 2) Var(mu_p) = 1/800, (1, 3)
+      # Var(mu_q) = 9/800, (0, 1) = (0, 3) = (1, 2) = Cov(mu_p, mu_q) = 1/2 * sqrt(1/800) * sqrt(9/800) = 3/1600. Within a:
+      # (2, 3) 3/1600 + 1/2 * sqrt(3/100) * sqrt(1/100) = 3/1600 + sqrt(3)/200.
       rows = lambda do |name, by_cell|
         by_cell.flat_map do |cell, (first, second)|
           [ { cell: cell, arm: :ref, covariate: "k", weight: 2.0, value: 2.0 * first },
@@ -240,8 +380,11 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
       expect_close(levels[:q]["c2"][1], rational(1, 32), "q's variance in c2")
       expect_means(answer, { ref: [ rational(21, 20), rational(11, 20) ], a: [ rational(31, 20), rational(17, 20) ] })
       { [ 0, 0 ] => rational(1, 800), [ 1, 1 ] => rational(9, 800), [ 2, 2 ] => rational(1, 32),
-        [ 3, 3 ] => rational(17, 800), [ 0, 2 ] => rational(3, 640) }.each do |(i, j), value|
+        [ 3, 3 ] => rational(17, 800), [ 0, 2 ] => rational(1, 800), [ 1, 3 ] => rational(9, 800),
+        [ 0, 1 ] => rational(3, 1600), [ 0, 3 ] => rational(3, 1600), [ 1, 2 ] => rational(3, 1600),
+        [ 2, 3 ] => rational(3, 1600) + (Math.sqrt(3.0) / 200) }.each do |(i, j), value|
         expect_close(answer[:covariance][i][j], value, "covariance (#{i}, #{j})")
+        expect(answer[:covariance][j][i]).to eq(answer[:covariance][i][j])
       end
     end
 
@@ -266,32 +409,34 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
       expect(own.to_h).to eq(before)
     end
 
-    it "SL9 keeps the cell's own correlation, so shared credit's cancellation survives" do
-      # a and b share most of their rows, so a contrast of the two is far below the sum of their variances, in the
-      # own estimate and in the pooled one alike: var(a) + var(b) - 2 * rho * sd(a) * sd(b), rho the own one.
+    it "SL9 cancels the level from every contrast of two arms, whatever its variance and own's correlation of the two" do
+      # a and b share most of their rows, so own holds them strongly correlated; nothing of that is read. One part:
+      # every entry between two arms is Var(mu) and each diagonal Var(mu) + Var(delta), so a contrast of two arms is
+      # their deltas' alone: a - b 9/100 + 16/100 = 1/4 at mean 1/10 - 3/10 = -1/5, a - ref 9/100, b - ref 16/100, at a
+      # level's variance of 1/25 and of 9/4 alike.
       rows = [ { credit: { ref: 2.0 }, values: [ 1.0 ] }, { credit: { ref: 2.0 }, values: [ 3.0 ] },
                { credit: { ref: 2.0 }, values: [ 0.0 ] } ]
       rows += [ 2.0, 0.0, 1.0, 4.0, 0.0, 3.0 ].map { |value| { credit: { a: 2.0, b: 2.0 }, values: [ value ] } }
       rows += [ { credit: { a: 2.0 }, values: [ 1.0 ] }, { credit: { b: 2.0 }, values: [ 2.0 ] } ]
       own = shared_credit.estimate(rows, arms: %i[ref a b], parts: %i[p])
       pairs = { "c1" => { contrasts.pair(:a, :p) => [ 0.1, 0.09 ], contrasts.pair(:b, :p) => [ 0.3, 0.16 ] } }
-      answer = pooled(own, "c1", effects_given: pairs, baselines_given: { p: { "c1" => [ 2.0, 0.04 ] } })
-      rho = correlation(own[:covariance], 1, 2)
 
-      [ [ 0, 1 ], [ 0, 2 ], [ 1, 2 ] ].each do |first, second|
-        expect_close(correlation(answer[:covariance], first, second), correlation(own[:covariance], first, second),
-                     "correlation (#{first}, #{second})")
+      expect(correlation(own[:covariance], 1, 2)).to be > 0.5
+      [ rational(1, 25), rational(9, 4) ].each do |variance|
+        answer = pooled(own, "c1", effects_given: pairs, baselines_given: { p: { "c1" => [ 2.0, variance.to_f ] } })
+        gap = shared_credit.contrast(answer, :a, :b, weights: [ 1.0 ])
+
+        expect_close(gap[:mean], rational(-1, 5), "the contrast's mean at #{variance}")
+        expect_close(gap[:variance], rational(1, 4), "a - b at #{variance}")
+        expect_close(shared_credit.contrast(answer, :a, :ref, weights: [ 1.0 ])[:variance], rational(9, 100), "a - ref")
+        expect_close(shared_credit.contrast(answer, :b, :ref, weights: [ 1.0 ])[:variance], rational(16, 100), "b - ref")
       end
-      expect(rho).to be > 0.5
-      # sds sqrt(0.04 + 0.09) and sqrt(0.04 + 0.16); var(a) + var(b) = 0.33.
-      gap = shared_credit.contrast(answer, :a, :b, weights: [ 1.0 ])
-      expect_close(gap[:mean], 0.1 - 0.3, "the contrast's mean")
-      expect_close(gap[:variance], 0.33 - (2.0 * rho * Math.sqrt(0.13 * 0.2)), "the contrast's variance")
-      expect(gap[:variance]).to be < 0.25
     end
 
     it "SL9 answers a covariance LinearValue takes, at full rank" do
-      # c1's own correlation is of full rank and the pooled covariance is D * R * D, so every eigenvalue stays above 0.
+      # c1's own correlation between parts is of full rank in each arm, and the pooled covariance is J (x) L, the level's
+      # block over both arms, plus a's block: x' * cov * x = (x_ref + x_a)' L (x_ref + x_a) + x_a' A x_a, which is 0
+      # only at x_a = 0 and then x_ref = 0, so every eigenvalue stays above 0.
       answer = pooled(own_one, "c1")
       means = answer[:means]
       summary = SkiftetStatistical::LinearValue.summary(
@@ -306,8 +451,8 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
     end
 
     it "SL9 answers a covariance LinearValue takes where its own is of lower rank, on the answer's rounding" do
-      # Fewer rows than entries, so the own correlation is of lower rank and D * R * D with it. Each trial's sds move by
-      # different factors, the case that scales each row's rounding differently.
+      # Fewer rows than entries, so own's blocks are of lower rank and the level's and each arm's block with them. Each
+      # trial's sds move by different factors, the case that scales each row's rounding differently.
       rng = Random.new(11)
       40.times do |trial|
         rows = Array.new(3) do
@@ -414,29 +559,32 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
       answer = pooled(own, "c1", effects_given: { "c1" => { name => [ 0.5, 0.03 ] } },
                                  baselines_given: { p: { "c1" => [ 1.0, 0.01 ] } })
 
-      # The correlation is 0.012 / (0.2 * 0.3) = 1/5, the sds 1/10 and 1/5: (0, 2) 1/5 * 1/10 * 1/5 = 1/250.
+      # One part, so between the two arms with credit the level alone: (0, 2) Var(mu) = 1/100, own's 0.012 not read;
+      # b's diagonal 1/100 + 3/100 = 1/25.
       expect(answer[:means][:a]).to be_nil
       expect(answer[:weight_sums][:a]).to eq(0.0)
       expect(answer[:effective][:a]).to eq(0.0)
       expect_means(answer.merge(means: answer[:means].compact), { ref: [ 1 ], b: [ rational(3, 2) ] })
-      expect_covariance(answer, [ [ rational(1, 100), 0, rational(1, 250) ], [ 0, 0, 0 ],
-                                  [ rational(1, 250), 0, rational(1, 25) ] ])
+      expect_covariance(answer, [ [ rational(1, 100), 0, rational(1, 100) ], [ 0, 0, 0 ],
+                                  [ rational(1, 100), 0, rational(1, 25) ] ])
     end
 
     it "SL9 answers the worked one-part example" do
-      # Own correlation 0.012 / (0.2 * 0.3) = 1/5, sds sqrt(1/100) = 1/10 and sqrt(1/100 + 3/100) = 1/5: 1/5 * 1/10 *
-      # 1/5 = 1/250. Means 1 and 1 + 1/2.
+      # One part: (0, 1) is Cov(mu, mu) = Var(mu) = 1/100, and own's correlation of 1/5 between the arms is not read;
+      # a's variance 1/100 + 3/100 = 1/25. Means 1 and 1 + 1/2.
       own = estimate(%i[p], { ref: [ 1.0 ], a: [ 2.0 ] }, [ [ 0.04, 0.012 ], [ 0.012, 0.09 ] ])
       answer = pooled(own, "c1", effects_given: { "c1" => { contrasts.pair(:a, :p) => [ 0.5, 0.03 ] } },
                                  baselines_given: { p: { "c1" => [ 1.0, 0.01 ] } })
 
       expect_means(answer, { ref: [ 1 ], a: [ rational(3, 2) ] })
-      expect_covariance(answer, [ [ rational(1, 100), rational(1, 250) ], [ rational(1, 250), rational(1, 25) ] ])
+      expect_covariance(answer, [ [ rational(1, 100), rational(1, 100) ], [ rational(1, 100), rational(1, 25) ] ])
     end
 
-    it "SL9 gives an own variance of 0 correlation 0 off the diagonal and its pooled variance on it" do
+    it "SL9 gives an arm's delta correlation 0 beside its own variance of 0, its pooled variance on the diagonal" do
       # a's part q never varied in this cell, so own's row and column of it are 0 and its contrast was left out of fit.
-      # The fit answers the cell from its node all the same: its diagonal is 1/100 + 3/100, its row 0 beside it.
+      # The fit answers the cell from its node all the same: its diagonal is 1/100 + 3/100 = 1/25. rho_a(p, q) is 0, so
+      # (2, 3) is the level's alone; the level keeps ref's 0.01 / (0.2 * 0.1) = 1/2: Cov(mu_p, mu_q) = 1/2 * 1/10 * 1/10
+      # = 1/200, which (0, 1), (0, 3), (1, 2) and (2, 3) hold; (0, 2) and (1, 3) hold Var(mu_p) = Var(mu_q) = 1/100.
       own = estimate(%i[p q], { ref: [ 1.0, 0.5 ], a: [ 2.0, 0.5 ] },
                      [ [ 0.04, 0.01, 0.012, 0.0 ], [ 0.01, 0.01, 0.0, 0.0 ], [ 0.012, 0.0, 0.09, 0.0 ],
                        [ 0.0, 0.0, 0.0, 0.0 ] ])
@@ -444,50 +592,78 @@ RSpec.describe "SkiftetStatistical::AdditiveContrasts pins" do
       levels = { p: { "c1" => [ 1.0, 0.01 ] }, q: { "c1" => [ 0.4, 0.01 ] } }
       answer = pooled(own, "c1", effects_given: names, baselines_given: levels)
 
-      expect_close(answer[:covariance][3][3], rational(1, 25), "its pooled variance")
-      expect(answer[:covariance][3].first(3)).to eq([ 0.0, 0.0, 0.0 ])
-      expect(answer[:covariance].first(3).map(&:last)).to eq([ 0.0, 0.0, 0.0 ])
-      expect_close(answer[:covariance][0][1], rational(1, 2) * rational(1, 10) * rational(1, 10), "the others keep theirs")
+      expect_covariance(answer, [ [ rational(1, 100), rational(1, 200), rational(1, 100), rational(1, 200) ],
+                                  [ rational(1, 200), rational(1, 100), rational(1, 200), rational(1, 100) ],
+                                  [ rational(1, 100), rational(1, 200), rational(1, 25), rational(1, 200) ],
+                                  [ rational(1, 200), rational(1, 100), rational(1, 200), rational(1, 25) ] ])
     end
 
     it "SL9 reads correlation 0 beside an own variance of 0, whatever the entry says" do
-      # No variance has no correlation to keep, so the moved entry is 0 and not some share of the sds.
-      own = estimate(%i[p], { ref: [ 1.0 ], a: [ 2.0 ] }, [ [ 0.0, 0.01 ], [ 0.01, 0.04 ] ])
-      answer = pooled(own, "c1", effects_given: { "c1" => { contrasts.pair(:a, :p) => [ 0.5, 0.03 ] } },
-                                 baselines_given: { p: { "c1" => [ 1.0, 0.01 ] } })
+      # No variance has no correlation to keep: ref's q and a's p have own variance 0 beside an entry of 0.01, so
+      # Cov(mu_p, mu_q) and Cov(delta_ap, delta_aq) are 0, not some share of the sds. What is left: (0, 0) 1/100,
+      # (1, 1) 1/25, (2, 2) 1/100 + 3/100 = 1/25, (3, 3) 1/25 + 1/20 = 9/100, (0, 2) 1/100, (1, 3) 1/25.
+      own = estimate(%i[p q], { ref: [ 1.0, 0.5 ], a: [ 2.0, 0.5 ] },
+                     [ [ 0.04, 0.01, 0.0, 0.0 ], [ 0.01, 0.0, 0.0, 0.0 ], [ 0.0, 0.0, 0.0, 0.01 ],
+                       [ 0.0, 0.0, 0.01, 0.04 ] ])
+      names = { "c1" => { contrasts.pair(:a, :p) => [ 0.5, 0.03 ], contrasts.pair(:a, :q) => [ 0.2, 0.05 ] } }
+      levels = { p: { "c1" => [ 1.0, 0.01 ] }, q: { "c1" => [ 0.5, 0.04 ] } }
+      answer = pooled(own, "c1", effects_given: names, baselines_given: levels)
 
-      expect_covariance(answer, [ [ rational(1, 100), 0 ], [ 0, rational(1, 25) ] ])
+      expect_covariance(answer, [ [ rational(1, 100), 0, rational(1, 100), 0 ], [ 0, rational(1, 25), 0, rational(1, 25) ],
+                                  [ rational(1, 100), 0, rational(1, 25), 0 ], [ 0, rational(1, 25), 0, rational(9, 100) ] ])
     end
 
     it "SL9 reads a correlation that rounding takes past 1 as 1" do
-      # Own sds 1 and 1 with an entry a little above 1: the exact correlation is within 1, so the entry is 1/10 * 1/5.
-      own = estimate(%i[p], { ref: [ 1.0 ], a: [ 2.0 ] }, [ [ 1.0, 1.0 + 1e-9 ], [ 1.0 + 1e-9, 1.0 ] ])
-      answer = pooled(own, "c1", effects_given: { "c1" => { contrasts.pair(:a, :p) => [ 0.5, 0.03 ] } },
-                                 baselines_given: { p: { "c1" => [ 1.0, 0.01 ] } })
+      # Own sds 1 and 1 in each arm with an entry a little above 1 between the parts: the exact correlation is within 1,
+      # so Cov(mu_p, mu_q) = 1/10 * 1/5 = 1/50 and Cov(delta_ap, delta_aq) = 3/10 * 2/5 = 3/25. (0, 0) 1/100, (1, 1)
+      # 1/25, (2, 2) 1/100 + 9/100 = 1/10, (3, 3) 1/25 + 4/25 = 1/5, (0, 2) 1/100, (1, 3) 1/25, (0, 1) = (0, 3) = (1, 2)
+      # = 1/50, (2, 3) 1/50 + 3/25 = 7/50.
+      past = 1.0 + 1e-9
+      own = estimate(%i[p q], { ref: [ 1.0, 0.5 ], a: [ 2.0, 0.5 ] },
+                     [ [ 1.0, past, 0.0, 0.0 ], [ past, 1.0, 0.0, 0.0 ], [ 0.0, 0.0, 1.0, past ], [ 0.0, 0.0, past, 1.0 ] ])
+      names = { "c1" => { contrasts.pair(:a, :p) => [ 0.5, 0.09 ], contrasts.pair(:a, :q) => [ 0.2, 0.16 ] } }
+      levels = { p: { "c1" => [ 1.0, 0.01 ] }, q: { "c1" => [ 0.5, 0.04 ] } }
+      answer = pooled(own, "c1", effects_given: names, baselines_given: levels)
 
-      expect_covariance(answer, [ [ rational(1, 100), rational(1, 50) ], [ rational(1, 50), rational(1, 25) ] ])
+      expect_covariance(answer, [ [ rational(1, 100), rational(1, 50), rational(1, 100), rational(1, 50) ],
+                                  [ rational(1, 50), rational(1, 25), rational(1, 50), rational(1, 25) ],
+                                  [ rational(1, 100), rational(1, 50), rational(1, 10), rational(7, 50) ],
+                                  [ rational(1, 50), rational(1, 25), rational(7, 50), rational(1, 5) ] ])
     end
 
     it "SL9 reads an arm left out of fit's arms: at effect [0.0, 0.0], beside the reference arm" do
-      # b is named, so ref alone is the reference; b's mean is mu and its variance Var(mu), as ref's.
+      # b is named, so ref alone is the reference; b's delta is 0 with variance 0, so its theta is the level: its mean
+      # mu, its variance Var(mu) and every entry beside it the level's, Var(mu) = 1/100, as ref's.
       own = estimate(%i[p], { ref: [ 1.0 ], a: [ 2.0 ], b: [ 3.0 ] },
                      [ [ 0.04, 0.0, 0.0 ], [ 0.0, 0.09, 0.0 ], [ 0.0, 0.0, 0.16 ] ])
       names = { "c1" => { contrasts.pair(:a, :p) => [ 0.5, 0.03 ], contrasts.pair(:b, :p) => [ 0.0, 0.0 ] } }
       answer = pooled(own, "c1", effects_given: names, baselines_given: { p: { "c1" => [ 1.0, 0.01 ] } })
 
       expect_means(answer, { ref: [ 1 ], a: [ rational(3, 2) ], b: [ 1 ] })
-      expect_covariance(answer, [ [ rational(1, 100), 0, 0 ], [ 0, rational(1, 25), 0 ], [ 0, 0, rational(1, 100) ] ])
+      expect_covariance(answer, [ [ rational(1, 100), rational(1, 100), rational(1, 100) ],
+                                  [ rational(1, 100), rational(1, 25), rational(1, 100) ],
+                                  [ rational(1, 100), rational(1, 100), rational(1, 100) ] ])
     end
 
-    it "SL9 carries own's rounding to the answer's scale" do
-      # sds move from 1/5 to 1/10 (by 1/2) and from 3/10 to 1/5 (by 2/3): a bound of 1e-10 on every own entry is at most
-      # 1e-10 * 4/9 on a moved one, by the larger factor twice. Its own rounding, a few units of 1/25, is far below that.
+    it "SL9 carries own's rounding to the answer's scale, the level's block and the effects' each" do
+      # own_one's bound 1e-10, on c1's baselines and round effects (a|p sd 1/5, a|q sd 1/10). The level's block moves
+      # ref's sds 1/5 to 1/10 (by 1/2) and 1/10 to 3/40 (by 3/4); a's block moves a's 3/10 to 1/5 (by 2/3) and 1/5 to
+      # 1/10 (by 1/2). An entry holds one term of each block, so its bound is 1e-10 * ((3/4)^2 + (2/3)^2) = 1e-10 *
+      # (81 + 64) / 144 = 1e-10 * 145/144. The rounding of the entries, a few units of 1/20, is far below that.
+      effects = { "c1" => { pair_p => [ 0.5, 0.04 ], pair_q => [ 0.3, 0.01 ] } }
+      answer = pooled(own_one(1e-10), "c1", effects_given: effects)
+
+      expect(answer.rounding).to be_within(1e-14).of(1e-10 * rational(145, 144))
+      expect(answer.rounding).to be >= 1e-10 * rational(145, 144)
+    end
+
+    it "SL9 carries none of own's rounding where one part reads no entry of own's covariance" do
+      # One part: every entry is Var(mu) or Var(mu) + Var(delta), and own's bound of 1e-10 reaches none of them.
       own = estimate(%i[p], { ref: [ 1.0 ], a: [ 2.0 ] }, [ [ 0.04, 0.012 ], [ 0.012, 0.09 ] ], 1e-10)
       answer = pooled(own, "c1", effects_given: { "c1" => { contrasts.pair(:a, :p) => [ 0.5, 0.03 ] } },
                                  baselines_given: { p: { "c1" => [ 1.0, 0.01 ] } })
 
-      expect(answer.rounding).to be_within(1e-14).of(1e-10 * rational(4, 9))
-      expect(answer.rounding).to be >= 1e-10 * rational(4, 9)
+      expect(answer.rounding).to be_between(0.0, 1e-16).exclusive
     end
 
     it "SL9 gives the rounding of its own entries where own has none" do

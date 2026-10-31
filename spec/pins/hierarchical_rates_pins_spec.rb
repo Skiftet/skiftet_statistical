@@ -194,6 +194,256 @@ RSpec.describe "SkiftetStatistical::HierarchicalRates pins" do
     end
   end
 
+  # The leaf fit (SL13 (g), decided at the L1 barrier review on 2026-10-31): each parent's null rate is fitted with the
+  # leaves' strength and hot share, the leaves weighted by their posterior probability of being null, instead of read
+  # from a leave-one-out share. Every pinned digit below is the reference's, not the module's: the same independent
+  # 60-digit arithmetic as above, its fixed points iterated to a change of 1e-45 (the parent that does not settle is
+  # pinned at the reference's own 50th step). The module stops at a change of 1e-10 of the rate, which leaves it within
+  # 3e-11 of the fixed point here: at every pinned fixed point each step shrinks the change to at most 0.22 of the one
+  # before. Each grid choice was read off the reference's whole grid (in doubles) and checked in 60 digits at its best
+  # two points: the best beats the next by at least 0.04 in log-likelihood.
+  describe ".fit_leaves" do
+    def leaf_parents(list) = list.map { |leaves| leaves.map { |count, total| { count: count, total: total } } }
+
+    def expect_leaves(fit, pinned)
+      expect(fit.keys).to eq(%i[strength hot_share log_likelihood at_upper_bound converged rates hot])
+      expect_pin(fit[:strength], pinned[:strength], arithmetic_relative, "strength")
+      expect(fit[:hot_share]).to eq(pinned[:hot_share])
+      expect_pin(fit[:log_likelihood], pinned[:log_likelihood], lgamma_relative, "log_likelihood")
+      expect(fit[:at_upper_bound]).to be(pinned[:at_upper_bound])
+      expect(fit[:converged]).to eq(Array.new(fit[:rates].size, true))
+      pinned.fetch(:rates).each do |parent, rate|
+        expect_pin(fit[:rates][parent], rate, pinned.fetch(:rate_relative, lgamma_relative), "rate #{parent}")
+      end
+      pinned.fetch(:hot).each do |(parent, leaf), hot|
+        expect_pin(fit[:hot][parent][leaf], hot, lgamma_relative, "hot #{parent}/#{leaf}")
+      end
+    end
+
+    # (count, total) per leaf. Four parents of three to five leaves, a leaf well above its siblings in two of them,
+    # real counts (2.1, 7.5), and a parent with one leaf, which the fit leaves out.
+    def small_level = [ [ [ 3.0, 30.0 ], [ 2.0, 25.0 ], [ 14.0, 40.0 ], [ 4.0, 35.0 ] ],
+                        [ [ 6.0, 50.0 ], [ 2.1, 20.0 ], [ 5.0, 45.0 ] ],
+                        [ [ 0.0, 12.0 ], [ 1.0, 15.0 ], [ 7.5, 10.0 ], [ 1.0, 18.0 ], [ 2.0, 20.0 ] ],
+                        [ [ 10.0, 80.0 ], [ 12.0, 90.0 ], [ 9.0, 70.0 ] ],
+                        [ [ 4.0, 9.0 ] ] ]
+
+    def small_grid = [ 0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0 ]
+
+    def small_hot_shares = [ 0.4, 0.2, 0.1, 0.05 ]
+
+    it "SL15 pins a level at hot share 0: the pooled rates, every posterior 0.0, the all-Poisson likelihood, and a " \
+       "flat profile that ties to the larger strength" do
+      fit = rates.fit_leaves(parents: leaf_parents([ [ [ 2.0, 4.0 ], [ 6.0, 4.0 ] ], [ [ 0.0, 1.5 ], [ 1.0, 2.5 ] ] ]),
+                             grid: [ 2.0, 8.0 ], hot_shares: [ 0.0 ])
+      # Rates 8 / 8 and 1 / 4; expected 4, 4, 0.375 and 0.625; the log-likelihood is
+      # (2 + 6) ln 4 - 8 - ln 2! - ln 6! - 0.375 + ln 0.625 - 0.625 = 8 ln 4 - 9 - ln 1440 + ln 0.625.
+      expect_leaves(fit, strength: 8.0, hot_share: 0.0, log_likelihood: -5.6520471328566568, at_upper_bound: true,
+                         rates: { 0 => 1.0, 1 => 0.25 }, rate_relative: arithmetic_relative, hot: {})
+      expect(fit[:hot]).to eq([ [ 0.0, 0.0 ], [ 0.0, 0.0 ] ])
+    end
+
+    it "SL15 pins one parent's null rate at a given strength and hot share: the fixed point, a real count among its " \
+       "leaves" do
+      fit = rates.fit_leaves(parents: leaf_parents([ [ [ 1.0, 2.0 ], [ 12.0, 2.5 ], [ 2.4, 3.0 ], [ 3.0, 2.0 ] ] ]),
+                             grid: [ 2.0 ], hot_shares: [ 0.2 ])
+      expect_leaves(fit, strength: 2.0, hot_share: 0.2, log_likelihood: -12.573901991407499, at_upper_bound: true,
+                         rates: { 0 => 0.93969181692155423 },
+                         hot: { [ 0, 0 ] => 0.18324755633581008, [ 0, 1 ] => 0.98689295126009857,
+                                [ 0, 2 ] => 0.14378747590663737, [ 0, 3 ] => 0.15174961629578557 })
+    end
+
+    it "SL15 pins a small level's fit on a 7 x 4 grid, the parent with one leaf answered beside it" do
+      fit = rates.fit_leaves(parents: leaf_parents(small_level), grid: small_grid, hot_shares: small_hot_shares)
+      expect_leaves(fit, strength: 0.125, hot_share: 0.1, log_likelihood: -35.302021023226786, at_upper_bound: false,
+                         rates: { 0 => 0.17314397873277912, 1 => 0.11392509525597098, 2 => 0.063431630645454901,
+                                  3 => 0.12916781442696132 },
+                         hot: { [ 0, 0 ] => 0.024276360118616055, [ 0, 2 ] => 0.094426670540951427,
+                                [ 1, 1 ] => 0.017318660407721436, [ 2, 0 ] => 0.15698020261875109,
+                                [ 2, 2 ] => 0.99761460712245154, [ 3, 2 ] => 0.0083350187728200333,
+                                [ 4, 0 ] => 0.012480799433646678 })
+      # The lone parent's rate is its leaf's own, 4 / 9, as plain arithmetic.
+      expect_pin(fit[:rates][4], 4.0 / 9.0, arithmetic_relative, "lone rate")
+      expect(fit[:hot].map(&:size)).to eq([ 4, 3, 5, 3, 1 ])
+    end
+
+    it "SL15 pins a parent that has not settled after LEAF_STEPS steps: its rate after the 50th, not converged" do
+      # Its leaf of 12 sits near the line between null and hot, so each step moves its weight a little: the 50th step
+      # still moves the rate by 4.2e-9 of itself, 42 times LEAF_CHANGE, and the reference settles only after 288 steps,
+      # 1.2e-8 below the rate pinned here (the reference's own 50th step).
+      leaves = [ [ 5.0, 900.0 ], [ 1.0, 750.0 ], [ 12.0, 680.0 ], [ 1.0, 660.0 ], [ 2.0, 310.0 ] ]
+      fit = rates.fit_leaves(parents: leaf_parents([ leaves ]), grid: [ 0.25 ], hot_shares: [ 0.02 ])
+      expect(fit[:converged]).to eq([ false ])
+      expect_pin(fit[:rates][0], 0.0057431689633961154, lgamma_relative, "rate")
+      expect_pin(fit[:hot][0][2], 0.27802779791898702, lgamma_relative, "hot")
+      expect_pin(fit[:hot][0][0], 0.0034426010923924453, lgamma_relative, "hot")
+      expect_pin(fit[:log_likelihood], -15.611826209123217, lgamma_relative, "log_likelihood")
+    end
+
+    # 50 parents of five leaves, generated from round values: parent p's null rate is 0.05, 0.1, 0.15 or 0.2 (p mod 4)
+    # and its leaves' totals 100 to 500 (rotated); in every fifth parent one leaf, a different one each time, is hot,
+    # its rate five times its parent's, so 10 of the 250 leaves are hot: a hot share of 0.04. Each count is Poisson, by
+    # Knuth's product of uniforms from Random.new(4).
+    def generated_rates = [ 0.05, 0.1, 0.15, 0.2 ]
+
+    def hot_leaf(parent) = (parent % 5).zero? ? (parent / 5) % 5 : nil
+
+    def knuth(rng, mean)
+      limit = Math.exp(-mean)
+      count = 0
+      product = rng.rand
+      while product > limit
+        count += 1
+        product *= rng.rand
+      end
+      count
+    end
+
+    def generated_level
+      rng = Random.new(4)
+      Array.new(50) do |parent|
+        Array.new(5) do |leaf|
+          total = 100.0 * (1 + ((leaf + parent) % 5))
+          mean = total * generated_rates[parent % 4] * (leaf == hot_leaf(parent) ? 5.0 : 1.0)
+          { count: knuth(rng, mean).to_f, total: total }
+        end
+      end
+    end
+
+    def leaf_hot_grid = [ 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005 ]
+
+    it "SL15 pins the generated level where 1 of 5 leaves is hot in every fifth parent, on the whole grid" do
+      level = generated_level
+      # The fixture itself: a change in how it is drawn shows here first.
+      expect(level.flatten.sum { |leaf| leaf[:count] }).to eq(10_567.0)
+
+      fit = rates.fit_leaves(parents: level, hot_shares: leaf_hot_grid)
+      expect_leaves(fit, strength: 2.0**-1.5, hot_share: 0.05, log_likelihood: -820.35019070232997,
+                         at_upper_bound: false,
+                         rates: { 0 => 0.059298634209110246, 1 => 0.099355011869473139, 5 => 0.11002593023986243 },
+                         hot: { [ 0, 0 ] => 0.99993618941295859, [ 0, 1 ] => 0.011947629600024736,
+                                [ 1, 4 ] => 0.014897763600165977, [ 5, 2 ] => 0.019447171285825137 })
+    end
+
+    it "SL13(g) reads the generated level's hot leaves and null rates, where a leave-one-out fit overstates the hot " \
+       "share" do
+      level = generated_level
+      fit = rates.fit_leaves(parents: level, hot_shares: leaf_hot_grid)
+      level.each_index do |parent|
+        expect(fit[:rates][parent] / generated_rates[parent % 4]).to be_between(1 / 1.3, 1.3), "rate #{parent}"
+        fit[:hot][parent].each_with_index do |hot, leaf|
+          if leaf == hot_leaf(parent)
+            expect(hot).to be > 0.99, "hot leaf #{parent}/#{leaf}: #{hot}"
+          else
+            expect(hot).to be < 0.2, "null leaf #{parent}/#{leaf}: #{hot}"
+          end
+        end
+      end
+      # The grid's two hot shares around the true 0.04.
+      expect(fit[:hot_share]).to be_between(0.02, 0.05)
+
+      # The same leaves on leave-one-out expected counts: each hot leaf lifts its four siblings' share, so they read
+      # cold, and the fit reads a hot share of 0.2, five times the true one (its best beats every other hot share's by
+      # more than 10 in log-likelihood).
+      pairs = level.flat_map do |leaves|
+        count = leaves.sum { |leaf| leaf[:count] }
+        total = leaves.sum { |leaf| leaf[:total] }
+        leaves.map do |leaf|
+          share = rates.leave_one_out_share(parent_count: count, parent_total: total, node_count: leaf[:count],
+                                            node_total: leaf[:total], prior_share: 0.0, prior_strength: 0.0)
+          { count: leaf[:count], expected: leaf[:total] * share, siblings: leaves.size }
+        end
+      end
+      expect(rates.fit_strength(pairs: pairs, hot_grid: leaf_hot_grid)[:hot_share]).to eq(0.2)
+    end
+
+    it "SL6 answers each leaf's posterior as node's hot at its count and expected total * rate, bit for bit" do
+      fit = rates.fit_leaves(parents: leaf_parents(small_level), grid: small_grid, hot_shares: small_hot_shares)
+      small_level.each_with_index do |leaves, parent|
+        leaves.each_with_index do |(count, total), leaf|
+          node = rates.node(count: count, expected: total * fit[:rates][parent], strength: fit[:strength],
+                            hot_share: fit[:hot_share], threshold: 1.25, parent_tail: 0.0, parent_ratio: 1.0)
+          expect(fit[:hot][parent][leaf]).to eq(node[:hot])
+        end
+      end
+    end
+
+    it "SL7 maximises fit_strength's likelihood: at the fitted rates the two read the same log-likelihood, bit for bit" do
+      level = generated_level
+      fit = rates.fit_leaves(parents: level, hot_shares: leaf_hot_grid)
+      pairs = level.each_with_index.flat_map do |leaves, parent|
+        leaves.map do |leaf|
+          { count: leaf[:count], expected: leaf[:total] * fit[:rates][parent], siblings: leaves.size }
+        end
+      end
+      profile = rates.fit_strength(pairs: pairs, hot_grid: [ fit[:hot_share] ])[:profile]
+      expect(profile[rates::GRID.index(fit[:strength])][1]).to eq(fit[:log_likelihood])
+    end
+
+    it "SL7 leaves a parent with one leaf out of the fit: without it every other answer is the same, bit for bit" do
+      with = rates.fit_leaves(parents: leaf_parents(small_level), grid: small_grid, hot_shares: small_hot_shares)
+      without = rates.fit_leaves(parents: leaf_parents(small_level[0, 4]), grid: small_grid,
+                                 hot_shares: small_hot_shares)
+      expect(with.except(:converged, :rates, :hot)).to eq(without.except(:converged, :rates, :hot))
+      %i[converged rates hot].each { |key| expect(with[key][0, 4]).to eq(without[key]) }
+      expect(with[:rates][4]).to eq(4.0 / 9.0)
+      expect(with[:converged][4]).to be(true)
+    end
+
+    it "SL6 gives a parent with no count a null rate of 0 and its leaves the hot share itself" do
+      fit = rates.fit_leaves(parents: leaf_parents([ [ [ 0.0, 3.0 ], [ 0.0, 1.0 ] ], [ [ 1.0, 1.0 ], [ 2.0, 1.0 ] ] ]),
+                             grid: [ 1.0 ], hot_shares: [ 0.3 ])
+      expect(fit[:rates][0]).to eq(0.0)
+      fit[:hot][0].each { |hot| expect(hot).to be_within(1e-15).of(0.3) }
+      expect(fit[:converged]).to eq([ true, true ])
+    end
+
+    it "SL6 takes whole numbers given as Integers as the same real numbers" do
+      integers = [ [ [ 3, 30 ], [ 2, 25 ], [ 14, 40 ] ], [ [ 6, 50 ], [ 5, 45 ] ] ]
+      floats = integers.map { |leaves| leaves.map { |pair| pair.map(&:to_f) } }
+      expect(rates.fit_leaves(parents: leaf_parents(integers), grid: [ 1, 4 ], hot_shares: [ 0.1 ]))
+        .to eq(rates.fit_leaves(parents: leaf_parents(floats), grid: [ 1.0, 4.0 ], hot_shares: [ 0.1 ]))
+    end
+
+    it "SL6 does not take a step that no rate can explain: the parent keeps its rate, finite, and is not converged" do
+      # The first step weighs the leaf with no count so far above the other that the rate would fall to 0, which no
+      # count of 10,000 can come from.
+      fit = rates.fit_leaves(parents: leaf_parents([ [ [ 0.0, 1e6 ], [ 10_000.0, 1.0 ] ] ]), grid: [ 0.25 ],
+                             hot_shares: [ 0.5 ])
+      expect(fit[:rates]).to eq([ 10_000.0 / 1_000_001.0 ])
+      expect(fit[:converged]).to eq([ false ])
+      expect(fit[:log_likelihood]).to be_finite
+      expect(fit[:hot].flatten).to all(be_between(0.0, 1.0))
+    end
+
+    it "SL7 refuses a leaf fit outside its domain" do
+      good = leaf_parents([ [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ] ])
+      [
+        [ { parents: good, hot_shares: [ 1.0 ] }, /below 1/ ],
+        [ { parents: good, hot_shares: [ 0.2, 1.0 ] }, /below 1/ ],
+        [ { parents: good, hot_shares: [] }, /hot_shares/ ],
+        [ { parents: good, hot_shares: nil }, /hot_shares/ ],
+        [ { parents: good, hot_shares: [ 1.5 ] }, /hot_shares/ ],
+        [ { parents: good, hot_shares: [ 0.2 ], grid: [] }, /grid/ ],
+        [ { parents: good, hot_shares: [ 0.2 ], grid: [ 2.0, 1.0 ] }, /grid must rise/ ],
+        [ { parents: good, hot_shares: [ 0.2 ], grid: [ 1.0, 1.0 ] }, /grid must rise/ ],
+        [ { parents: good, hot_shares: [ 0.2 ], grid: [ 0.0, 1.0 ] }, /grid strength/ ],
+        [ { parents: [], hot_shares: [ 0.2 ] }, /no parent/ ],
+        [ { parents: leaf_parents([ [ [ 1.0, 2.0 ] ] ]), hot_shares: [ 0.2 ] }, /no parent/ ],
+        [ { parents: nil, hot_shares: [ 0.2 ] }, /parents/ ],
+        [ { parents: [ [] ], hot_shares: [ 0.2 ] }, /leaf/ ],
+        [ { parents: [ [ { count: 1.0 } ] ], hot_shares: [ 0.2 ] }, /total/ ],
+        [ { parents: [ [ { total: 1.0 } ] ], hot_shares: [ 0.2 ] }, /count/ ],
+        [ { parents: [ [ [ 1.0, 2.0 ] ] ], hot_shares: [ 0.2 ] }, /Hash/ ],
+        [ { parents: leaf_parents([ [ [ 1.0, 0.0 ], [ 3.0, 4.0 ] ] ]), hot_shares: [ 0.2 ] }, /total/ ],
+        [ { parents: leaf_parents([ [ [ -1.0, 2.0 ], [ 3.0, 4.0 ] ] ]), hot_shares: [ 0.2 ] }, /count/ ],
+        [ { parents: leaf_parents([ [ [ Float::NAN, 2.0 ], [ 3.0, 4.0 ] ] ]), hot_shares: [ 0.2 ] }, /count/ ]
+      ].each do |arguments, message|
+        expect { rates.fit_leaves(**arguments) }.to raise_error(ArgumentError, message), "accepted #{arguments}"
+      end
+    end
+  end
+
   # The edges of the contract that no pin above reaches.
   describe "edges" do
     def node_arguments = { count: 6.0, expected: 2.5, strength: 8.0, hot_share: 0.5, threshold: 1.25, parent_tail: 0.0,

@@ -1108,4 +1108,266 @@ RSpec.describe "SkiftetStatistical::SharedCredit pins" do
       end
     end
   end
+
+  # The orchestrator's ruling of 2026-10-31 on SL13 (e): a contrast for a fit across cells, whose variance is the
+  # null-homoscedastic sandwich. With u_ai = w_ai / W_a and y_i = sum_p weight_p * x_ip, each arm's per-visit variance is
+  # s_a^2 = sum_i w_ai^2 * (y_i - V_a)^2 / sum_i w_ai^2, its Kish's size n_a = W_a^2 / sum_i w_ai^2 = 1 / sum_i u_ai^2,
+  # the pooled per-visit variance s^2 = (n_a * s_a^2 + n_r * s_r^2) / (n_a + n_r), and the variance
+  # s^2 * (sum_i u_ai^2 + sum_i u_ri^2). Every pinned value was checked first by an independent reference in exact
+  # Rationals over the exact binary value of every Float input, from the rows by these definitions, never through the
+  # module's covariance; the small cases are worked by hand below. `contrast` is unchanged (its pins above stand).
+  describe ".contrast_for_fit" do
+    # Two arms, two parts, credits that vary within each arm.
+    let(:two_arm_rows) do
+      [
+        { credit: { a: 2.0 }, values: [ 1.0, 0.0 ] }, { credit: { a: 2.0 }, values: [ 0.0, 2.0 ] },
+        { credit: { a: 4.0 }, values: [ 1.0, 1.0 ] }, { credit: { a: 4.0 }, values: [ 0.0, 0.0 ] },
+        { credit: { r: 1.25 }, values: [ 1.0, 0.0 ] }, { credit: { r: 2.5 }, values: [ 0.0, 0.0 ] },
+        { credit: { r: 5.0 }, values: [ 0.0, 1.0 ] }, { credit: { r: 1.25 }, values: [ 2.0, 0.0 ] }
+      ]
+    end
+
+    def two_arm_estimate(chosen_arms = %i[a r])
+      shared_credit.estimate(two_arm_rows, arms: chosen_arms, parts: %i[p q])
+    end
+
+    it "SL15 pins the pooled variance, worked by hand, on two arms whose per-visit variances differ" do
+      # By hand. W_a = 12, sum w^2 = 40, so n_a = 144/40 = 18/5; W_r = 10, sum w^2 = 275/8, so n_r = 100 / (275/8) =
+      # 32/11, and sum u_a^2 + sum u_r^2 = 5/18 + 11/32 = 179/288.
+      # At p 1, q 1/2 the rows' y are 1, 1, 3/2, 0 for a and 1, 0, 1/2, 2 for r: V_a = 10/12 = 5/6, V_r = (25/4) / 10 =
+      # 5/8, the mean 5/24. s_a^2 = (4 * (1/6)^2 + 4 * (1/6)^2 + 16 * (2/3)^2 + 16 * (5/6)^2) / 40 = 83/180 and s_r^2 =
+      # (25/16 * (3/8)^2 + 25/4 * (5/8)^2 + 25 * (1/8)^2 + 25/16 * (11/8)^2) / (275/8) = 123/704. Pooled:
+      # (18/5 * 83/180 + 32/11 * 123/704) / (18/5 + 32/11) = (83/50 + 123/242) / (358/55) = 6559/19690, and the variance
+      # 6559/19690 * 179/288 = 6559/31680. Reversed: the mean -5/24, the same variance.
+      # At p 0, q 1 (part q alone) the y are 0, 2, 1, 0 and 0, 0, 1, 0: V_a = 8/12 = 2/3, V_r = 5/10 = 1/2, the mean
+      # 1/6; s_a^2 = (4 * (2/3)^2 + 4 * (4/3)^2 + 16 * (1/3)^2 + 16 * (2/3)^2) / 40 = 4/9, s_r^2 = 1/4, pooled
+      # (18/5 * 4/9 + 32/11 * 1/4) / (358/55) = (8/5 + 8/11) / (358/55) = 64/179, the variance 64/179 * 179/288 = 2/9.
+      estimate = two_arm_estimate
+
+      aggregate_failures do
+        expect_pins(shared_credit.contrast_for_fit(estimate, :a, :r, weights: [ 1.0, 0.5 ], minimum_effective: 2),
+                    { mean: 0.20833333333333334, variance: 0.20703914141414143 }, "a - r")
+        expect_pins(shared_credit.contrast_for_fit(estimate, :r, :a, weights: { q: 0.5, p: 1.0 }, minimum_effective: 2),
+                    { mean: -0.20833333333333334, variance: 0.20703914141414143 }, "r - a")
+        expect_pins(shared_credit.contrast_for_fit(estimate, :a, :r, weights: [ 0.0, 1.0 ], minimum_effective: 2),
+                    { mean: 0.16666666666666666, variance: 0.2222222222222222 }, "a - r on part q")
+        # contrast stays the plug-in v_a + v_r = (83/180) / (18/5) + (123/704) / (32/11) = 83/648 + 123/2048 =
+        # 31211/165888.
+        expect_pins(shared_credit.contrast(estimate, :a, :r, weights: [ 1.0, 0.5 ]),
+                    { mean: 0.20833333333333334, variance: 0.18814501350308643 }, "contrast a - r, unchanged")
+      end
+    end
+
+    it "equals contrast where the two arms' per-visit variances agree" do
+      # By hand: a holds 1, 0, 0, 1 at credit 2 (V 1/2, s^2 1/4, n 4) and r holds 3, 2 at credit 4 (V 5/2, s^2 1/4,
+      # n 2), so the pooled s^2 is 1/4, the variance 1/4 * (1/4 + 1/2) = 3/16 = 1/16 + 1/8, contrast's, and the mean -2.
+      rows = [ 1.0, 0.0, 0.0, 1.0 ].map { |value| { credit: { a: 2.0 }, values: [ value ] } } +
+             [ 3.0, 2.0 ].map { |value| { credit: { r: 4.0 }, values: [ value ] } }
+      estimate = shared_credit.estimate(rows, arms: %i[a r], parts: %i[p])
+      answer = shared_credit.contrast_for_fit(estimate, :a, :r, weights: [ 1.0 ], minimum_effective: 2)
+
+      expect_pins(answer, { mean: -2.0, variance: 0.1875 }, "a - r")
+      expect(answer).to eq(shared_credit.contrast(estimate, :a, :r, weights: [ 1.0 ]))
+    end
+
+    it "SL15 pins it on the eight shared rows, the term of the credit two arms share left out" do
+      # Kish's sizes a 3.74, b 4.60 and c 3.20 clear a minimum of 3. contrast's a - b variance (0.741, pinned above)
+      # holds -2 times the covariance the shared rows give (-0.029); this one holds none of it.
+      estimate = shared_estimate
+      weights = { p: 1.0, q: 0.35, r: 2.5 }
+      pinned = {
+        %i[a b] => { mean: 1.7342280564263324, variance: 0.5899211511189675 },
+        %i[c b] => { mean: 2.7238119834710743, variance: 0.8085472128834688 },
+        %i[a c] => { mean: -0.9895839270447421, variance: 1.5477984874211663 }
+      }
+
+      aggregate_failures do
+        pinned.each do |(arm, reference), values|
+          expect_pins(shared_credit.contrast_for_fit(estimate, arm, reference, weights: weights, minimum_effective: 3),
+                      values, "#{arm} - #{reference}")
+        end
+      end
+    end
+
+    it "answers nil when either arm's Kish's size is under minimum_effective, 20 by default, and answers at it" do
+      estimate = two_arm_estimate
+      smaller = estimate[:effective][:r]
+      weights = [ 1.0, 0.5 ]
+      answered = shared_credit.contrast_for_fit(estimate, :a, :r, weights: weights, minimum_effective: 0)
+
+      expect(smaller).to eq(32.0 / 11.0)
+      expect(answered).to be_a(Hash)
+      expect(shared_credit.contrast_for_fit(estimate, :a, :r, weights: weights)).to be_nil
+      expect(shared_credit.contrast_for_fit(estimate, :a, :r, weights: weights, minimum_effective: 20)).to be_nil
+      expect(shared_credit.contrast_for_fit(estimate, :a, :r, weights: weights, minimum_effective: 2.91)).to be_nil
+      expect(shared_credit.contrast_for_fit(estimate, :r, :a, weights: weights, minimum_effective: 3.6)).to be_nil
+      expect(shared_credit.contrast_for_fit(estimate, :a, :r, weights: weights, minimum_effective: smaller)).to eq(answered)
+      expect(shared_credit.contrast_for_fit(estimate, :a, :r, weights: weights, minimum_effective: 2)).to eq(answered)
+      expect(shared_credit.contrast_for_fit(estimate, :a, :r, weights: weights, minimum_effective: Rational(29, 10))).to eq(answered)
+    end
+
+    it "answers nil for an arm with no credit, whatever the minimum, and 0 for an arm against itself" do
+      estimate = two_arm_estimate(%i[a r d])
+      weights = [ 1.0, 0.5 ]
+
+      expect(shared_credit.contrast_for_fit(estimate, :a, :d, weights: weights, minimum_effective: 0)).to be_nil
+      expect(shared_credit.contrast_for_fit(estimate, :d, :r, weights: weights, minimum_effective: 0)).to be_nil
+      expect(shared_credit.contrast_for_fit(estimate, :d, :d, weights: weights, minimum_effective: 0)).to be_nil
+      expect(shared_credit.contrast_for_fit(estimate, :a, :a, weights: weights, minimum_effective: 2)).to eq({ mean: 0.0, variance: 0.0 })
+      expect(shared_credit.contrast_for_fit(estimate, :a, :a, weights: weights)).to be_nil
+      expect_pins(shared_credit.contrast_for_fit(estimate, :a, :r, weights: weights, minimum_effective: 2),
+                  { mean: 0.20833333333333334, variance: 0.20703914141414143 }, "a - r beside an arm with no credit")
+    end
+
+    it "reads an estimate back from JSON and from from_sums, and arms by Symbol or String" do
+      estimate = shared_estimate
+      weights = [ 1.0, 0.35, 2.5 ]
+      answer = shared_credit.contrast_for_fit(estimate, :a, :b, weights: weights, minimum_effective: 3)
+      by_sums = shared_credit.contrast_for_fit(shared_credit.from_sums(single_sums, arms: %i[a b], parts: parts), :a, :b,
+                                               weights: weights, minimum_effective: 1)
+      by_rows = shared_credit.contrast_for_fit(shared_credit.estimate(single_rows, arms: %i[a b], parts: parts), :a, :b,
+                                               weights: weights, minimum_effective: 1)
+
+      expect(shared_credit.contrast_for_fit(json(estimate), "a", :b, weights: weights, minimum_effective: 3)).to eq(answer)
+      expect(shared_credit.contrast_for_fit(estimate, "a", "b", weights: weights, minimum_effective: 3)).to eq(answer)
+      expect(by_sums.keys).to eq(%i[mean variance])
+      expect((by_sums[:mean] - by_rows[:mean]).abs).to be <= relative * by_rows[:mean].abs
+      expect((by_sums[:variance] - by_rows[:variance]).abs).to be <= relative * by_rows[:variance]
+    end
+
+    it "refuses a minimum that is no finite number at least 0, an estimate with no Kish's sizes or malformed ones, " \
+       "and an arm the estimate does not name" do
+      estimate = two_arm_estimate
+      weights = [ 1.0, 0.5 ]
+
+      [ -1, -0.5, Float::NAN, Float::INFINITY, 10**400, "20", nil, Complex(20, 1) ].each do |bad|
+        expect_refused("minimum_effective #{bad.inspect}") do
+          shared_credit.contrast_for_fit(estimate, :a, :r, weights: weights, minimum_effective: bad)
+        end
+      end
+      {
+        "no effective" => estimate.except(:effective),
+        "effective as an Array" => estimate.merge(effective: [ 3.6, 2.9 ]),
+        "an arm with no size" => estimate.merge(effective: { a: 3.6 }),
+        "a size for no arm" => estimate.merge(effective: estimate[:effective].merge(z: 1.0)),
+        "an arm twice" => estimate.merge(effective: estimate[:effective].merge("a" => 3.6)),
+        "a size below 0" => estimate.merge(effective: estimate[:effective].merge(r: -1.0)),
+        "a size that is no number" => estimate.merge(effective: estimate[:effective].merge(r: Float::NAN))
+      }.each do |label, bad|
+        expect_refused(label) { shared_credit.contrast_for_fit(bad, :a, :r, weights: weights, minimum_effective: 2) }
+      end
+      expect_refused("an arm of no name") { shared_credit.contrast_for_fit(estimate, :a, :z, weights: weights) }
+      expect_refused("weights one short") { shared_credit.contrast_for_fit(estimate, :a, :r, weights: [ 1.0 ]) }
+    end
+
+    it "refuses a per-visit variance that overflows rather than answer an infinity" do
+      wide = { means: { a: [ 1.0 ], b: [ 1.0 ] }, covariance: [ [ 1e308, 0.0 ], [ 0.0, 1e308 ] ],
+               effective: { a: 10.0, b: 10.0 } }
+
+      expect { shared_credit.contrast_for_fit(wide, :a, :b, weights: [ 1.0 ], minimum_effective: 2) }
+        .to raise_error(ArgumentError, /Float's range/)
+    end
+
+    # The ruling's seeded check: two arms of equal value (a 0/1 part at 0.10 and a count of 1-3 at 0.05, weighed 1 and
+    # 1/2), 1,500 runs of 20 passes of 30 visits each, every run's visits folded into an ordinary test's per-arm sums and
+    # read once at its end (from_sums, the default minimum of 20). The z of a - reference over the runs it answers.
+    # Random.new(seed) alone draws, in one order per visit: the arm, then each part.
+    describe "z under equal arms, one arm at a 0.05 floor" do
+      # [z of contrast_for_fit, z of contrast] over the runs contrast_for_fit answers with a variance above 0. After
+      # each pass where both arms have credit, the block gets each arm's [value, plug-in variance] (reference first),
+      # the floor and a Hash it may keep across the run's passes, and answers the reference's next share.
+      def runs_of(seed, runs: 1_500, passes: 20, visits: 30, floor: 0.05, &share_after_pass)
+        rng = Random.new(seed)
+        weights = [ 1.0, 0.5 ]
+        fitted = []
+        plug_in = []
+        runs.times do
+          # Per arm: w, w2, a of each part, b of each part, c of (p, p), (p, q), (q, q).
+          sums = Array.new(2) { Array.new(9, 0.0) }
+          reference = 0.5
+          state = {}
+          passes.times do
+            visits.times do
+              arm = rng.rand < reference ? 0 : 1
+              credit = 1.0 / (arm.zero? ? reference : 1.0 - reference)
+              rate = rng.rand < 0.10 ? 1.0 : 0.0
+              count = rng.rand < 0.05 ? (1 + rng.rand(3)).to_f : 0.0
+              squared = credit * credit
+              row = sums[arm]
+              [ credit, squared, credit * rate, credit * count, squared * rate, squared * count, squared * rate * rate,
+                squared * rate * count, squared * count * count ].each_with_index { |term, index| row[index] += term }
+            end
+            next unless sums.all? { |row| row[0].positive? }
+
+            reference = share_after_pass.call(sums.map { |row| value_of(row, weights) }, floor, state)
+          end
+          credited = { reference: sums[0], a: sums[1] }.select { |_, row| row[0].positive? }.transform_values do |row|
+            { w: row[0], w2: row[1], a: { p: row[2], q: row[3] }, b: { p: row[4], q: row[5] },
+              c: { %i[p p] => row[6], %i[p q] => row[7], %i[q p] => row[7], %i[q q] => row[8] } }
+          end
+          estimate = shared_credit.from_sums(credited, arms: %i[reference a], parts: %i[p q])
+          answer = shared_credit.contrast_for_fit(estimate, :a, :reference, weights: weights)
+          next if answer.nil? || answer[:variance].zero?
+
+          fitted << (answer[:mean] / Math.sqrt(answer[:variance]))
+          plain = shared_credit.contrast(estimate, :a, :reference, weights: weights)
+          plug_in << (plain[:variance].positive? ? plain[:mean] / Math.sqrt(plain[:variance]) : 0.0)
+        end
+        [ fitted, plug_in ]
+      end
+
+      # [V, its plug-in variance] of one arm's sums at the weights.
+      def value_of(row, weights)
+        value = ((weights[0] * row[2]) + (weights[1] * row[3])) / row[0]
+        squares = (weights[0]**2 * row[6]) + (2 * weights[0] * weights[1] * row[7]) + (weights[1]**2 * row[8])
+        crossed = (weights[0] * row[4]) + (weights[1] * row[5])
+        [ value, [ (squares - (2 * value * crossed) + (value * value * row[1])) / (row[0] * row[0]), 0.0 ].max ]
+      end
+
+      # [mean, variance] of the values.
+      def moments(values)
+        mean = values.sum / values.size
+        [ mean, values.sum { |value| (value - mean)**2 } / (values.size - 1) ]
+      end
+
+      it "has variance near 1 where the allocation, once the other arm leads, holds the reference at its floor" do
+        # Adaptive: both arms at 1/2 until a pass ends with a ahead, then the reference at 0.05 for the rest of the run.
+        # Measured: 1,496 runs answered, z's mean -0.057 and variance 0.976; contrast's z on the same runs 0.242 and
+        # 2.319, which the ruling corrects (seeds 1-6 gave 1.00-1.07 against 1.73-2.63).
+        fitted, plug_in = runs_of(20_261_031) do |(reference, other), floor, state|
+          state[:held] ||= other[0] > reference[0]
+          state[:held] ? floor : 0.5
+        end
+        mean, variance = moments(fitted)
+
+        expect(fitted.size).to be >= 1_400
+        aggregate_failures do
+          expect((variance - 1.0).abs).to be <= 0.1, "z's variance is #{variance}"
+          expect(mean.abs).to be <= 0.1, "z's mean is #{mean}"
+          expect(moments(plug_in).last).to be >= 1.5
+        end
+      end
+
+      it "is never wider than 1 where the shares follow each pass's chance of being ahead, floored at 0.05" do
+        # Adaptive at every pass: the reference's share is the normal chance, on the plug-in sums, that it is ahead,
+        # clamped to [0.05, 0.95]. The realised Kish's sizes then move against the estimates (an arm that falls behind
+        # is held small), and the pooled z is narrower than 1: a test across cells on it rejects less often than its
+        # level, never more. Measured: 1,498 runs, z's variance 0.646, contrast's 2.048 (seeds 1-6: 0.64-0.70 against
+        # 1.65-2.52).
+        fitted, plug_in = runs_of(20_261_031) do |(reference, other), floor, _state|
+          spread = Math.sqrt(reference[1] + other[1])
+          # With no spread at all the one ahead is certain: 1.0 for the reference, 0.5 at a tie, 0.0 for the other.
+          ahead = ((reference[0] <=> other[0]) + 1) / 2.0
+          ahead = 0.5 * Math.erfc(-(reference[0] - other[0]) / spread / Math.sqrt(2.0)) if spread.positive?
+          ahead.clamp(floor, 1.0 - floor)
+        end
+
+        expect(fitted.size).to be >= 1_400
+        aggregate_failures do
+          expect(moments(fitted).last).to be <= 1.1
+          expect(moments(plug_in).last).to be >= 1.5
+        end
+      end
+    end
+  end
 end

@@ -37,6 +37,15 @@ module SkiftetStatistical
   # grouping and arm it names keeps that value, takes no moment step and stays in the answer, used here or not, and
   # whatever it does not name is fitted.
   #
+  # THE TEST OF NO VARIATION stands beside each variance: the answer is a Hash of the three keys below that also
+  # answers #variation_tests, { "tree:<depth>" | name => { arm => { statistic:, degrees:, p_value: } } } for every depth
+  # and grouping of the cells, held in `variances:` or not. `statistic` is the spread above, sum P * (estimate -
+  # mean)^2 (Cochran's Q), `degrees` the sum of K - 1, and `p_value` the chance under tau^2 = 0 of a spread at least
+  # this large: Q is then chi-squared on those degrees, so the moment (Q - degrees) / scale is tested one-sided against
+  # its own distribution at 0. No degrees (fewer than two groups) is p 1.0. The groups are those of the last sweep, on
+  # the others' means as they then stood, so a backfitted term's Q is near its chi-squared rather than exactly on it.
+  # A caller that holds a variance at 0 unless its test rejects hands the next fit that 0 in `variances:`.
+  #
   # POSTERIORS are normal-normal. The tree is solved exactly for given variances, by one pass up and one down: a node's
   # prior is its parent's posterior with the node's own contrasts taken back out, its variance widened by tau^2, so the
   # parent's uncertainty is carried down and nothing is counted twice. A key of a crossed grouping starts from
@@ -63,16 +72,24 @@ module SkiftetStatistical
   # pairs and the reference arm by any name no cell holds, and `.pooled_estimate` puts the two back together as a
   # SharedCredit estimate of one cell, which LinearValue and the allocator read as they read the cell's own:
   #
-  #   means[a][p]         = mu_p + delta_ap                    (the reference arm's delta is 0)
-  #   sd_pooled(a, p)^2   = Var(mu_p) + Var(delta_ap)          (the reference arm's is Var(mu_p) alone)
-  #   cov[(a, p), (b, q)] = rho_own[(a, p), (b, q)] * sd_pooled(a, p) * sd_pooled(b, q)
+  #   means[a][p]             = mu_p + delta_ap                        (the reference arm's delta is 0)
+  #   cov[(a, p), (b, q)]     = Cov(mu_p, mu_q) + [a == b] * Cov(delta_ap, delta_aq)
+  #   Cov(mu_p, mu_q)         = rho_level(p, q) * sd(mu_p) * sd(mu_q)          (Var(mu_p) at p == q)
+  #   Cov(delta_ap, delta_aq) = rho_a(p, q) * sd(delta_ap) * sd(delta_aq)      (Var(delta_ap) at p == q)
   #
-  # rho_own is the correlation `own` holds, so what shared credit cancels between two arms stays cancelled; an own
-  # variance of 0 has correlation 0 off the diagonal and sd_pooled^2 on it, and so does an arm no row credits, which
-  # keeps its nil means and its zero rows and columns. `own`'s `weight_sums` and `effective` stand as they are. The
-  # answer is D * R * D, with R the correlation, so it is positive semidefinite whenever `own` is. It answers #parts,
-  # and #rounding: `own`'s bound on an entry carried by the largest factor an sd moved, twice, as an entry moves by two,
-  # plus the rounding of moving an entry.
+  # The cell's level is one quantity, shared by every arm with credit, and each arm's delta is its own: a contrast of
+  # two arms holds their deltas alone, whatever the level's variance, so a cell with no effect has arms that move
+  # together and no share follows its level. Each block keeps the cell's own correlation between parts, read from
+  # `own` with the pooled sds: rho_level is the reference arm's (its theta is the level itself), rho_a arm a's. Nothing
+  # is read from `own` between two arms. A correlation beside an own variance of 0 is 0, one that rounding takes past
+  # 1 is 1, and Cov(mu_p, mu_p) between two arms is Var(mu_p), the level with itself. Where every arm with credit has an
+  # effect (the reference arm has no credit in this cell), rho_level is the first such arm's. An arm no row credits keeps
+  # its nil means and its zero rows and columns. `own`'s `weight_sums` and `effective` stand as they are. The answer is
+  # J (x) L plus each arm's block, J all ones over the arms with credit and every block D * R * D, so it is positive
+  # semidefinite whenever `own` is. It answers #parts, and #rounding: `own`'s bound on an entry carried by the largest
+  # factor an sd of the level's block moved, squared, plus the same of the effects' blocks, as an entry holds one of
+  # each; plus the rounding of building an entry. A cell of one part reads nothing of `own`'s covariance and carries
+  # none of its bound.
   #
   # The reference arm is read as `.baseline` reads it: the one arm with credit no cell of `effects` names, under any of
   # its pairs. Any other arm with credit and no effect for the cell raises, and so do two arms no cell names.
@@ -94,7 +111,8 @@ module SkiftetStatistical
       # cells: [{ id:, contrasts: { arm => [estimate, variance] }, tree: [root, ..., leaf], groups: { name => key } }]
       # -> { variances: { "tree:<depth>" | name => { arm => Float } },
       #      effects: { "tree:<depth>" | name => { key => { arm => [mean, variance] } } },
-      #      cells: { id => { arm => [mean, variance] } } }
+      #      cells: { id => { arm => [mean, variance] } } }, a Fit whose #variation_tests is
+      #    { "tree:<depth>" | name => { arm => { statistic: Float, degrees: Integer, p_value: Float } } }
       def fit(cells:, arms:, sweeps: 5, variances: nil)
         names = arm_names(arms)
         rounds = sweep_count(sweeps)
@@ -102,8 +120,8 @@ module SkiftetStatistical
         held = held_variances(variances, design, names)
         fits = names.to_h { |arm| [ arm, arm_fit(design, arm, held).run(rounds) ] }
 
-        { variances: variance_table(design, fits, held), effects: effect_table(design, fits),
-          cells: cell_table(design, fits) }
+        Fit.new({ variances: variance_table(design, fits, held), effects: effect_table(design, fits),
+                  cells: cell_table(design, fits) }, test_table(design, fits))
       end
 
       # rows: [{ cell:, arm:, covariate:, weight:, value:, weight_squared: nil, value_squared: nil, cross: nil }], the
@@ -157,20 +175,19 @@ module SkiftetStatistical
         credited = arms.reject { |arm| own[:means][arm].nil? }
         reference = reference_arms(credited, effects) { |arm| parts.map { |part| pair(arm, part) } }.first
         levels = credited.empty? ? [] : parts.map { |part| level_of(baselines, part, cell) }
-        terms = credited.to_h do |arm|
-          [ arm, parts.each_with_index.map do |part, at|
-            sum_of(levels[at], arm == reference ? [ 0.0, 0.0 ] : pooled_effect(effects, cell, pair(arm, part)))
-          end ]
+        shifts = credited.to_h do |arm|
+          [ arm, parts.map { |part| arm == reference ? [ 0.0, 0.0 ] : pooled_effect(effects, cell, pair(arm, part)) } ]
         end
-        variances = arms.flat_map { |arm| terms.key?(arm) ? terms[arm].map(&:last) : Array.new(parts.size, 0.0) }
-        moved = Rescale.new(own_covariance(own, variances.size), variances)
+        shared = SharedLevel.new(own_covariance(own, arms.size * parts.size), parts.size,
+                                 arms.index(reference || credited.first), levels.map(&:last),
+                                 shifts.to_h { |arm, row| [ arms.index(arm), row.map(&:last) ] })
 
         SharedCredit::Estimate.new(parts, {
-          means: arms.to_h { |arm| [ arm, terms[arm]&.map(&:first) ] },
-          covariance: moved.covariance,
+          means: arms.to_h { |arm| [ arm, shifts[arm] && pooled_means(levels, shifts[arm]) ] },
+          covariance: shared.covariance,
           weight_sums: own[:weight_sums].dup,
           effective: own[:effective].dup
-        }, moved.rounding(own.rounding))
+        }, shared.rounding(own.rounding))
       end
 
       private
@@ -273,6 +290,10 @@ module SkiftetStatistical
         design.ids.each_with_index.to_h { |id, at| [ id, fits.transform_values { |fit| fit.cell(at) } ] }
       end
 
+      def test_table(design, fits)
+        design.variance_names.to_h { |name| [ name, fits.transform_values { |fit| fit.variation_test(name) } ] }
+      end
+
       def sum_rows(rows)
         raise ArgumentError, "rows must be an Enumerable of rows, got #{rows.class}" unless rows.is_a?(Enumerable)
 
@@ -358,9 +379,9 @@ module SkiftetStatistical
         [ Read.number(pair[0], "#{label}: its mean"), Read.variance(pair[1], "#{label}: its variance") ]
       end
 
-      # mu + delta, whose variances add: no term joins them.
-      def sum_of(level, effect)
-        [ Read.number(level[0] + effect[0], "a pooled mean"), Read.number(level[1] + effect[1], "a pooled variance") ]
+      # mu_p + delta_ap per part.
+      def pooled_means(levels, shifts)
+        shifts.each_with_index.map { |(mean, _variance), at| Read.number(levels[at][0] + mean, "a pooled mean") }
       end
 
       # own's covariance, checked `size` rows of `size` Floats.
@@ -407,27 +428,49 @@ module SkiftetStatistical
     end
     private_constant :Read
 
-    # A covariance moved to new variances, each entry keeping its correlation.
-    class Rescale
-      # The rounding of one entry moved, relative to it: the units of Float::EPSILON its quotient, its products and the
-      # square roots under them can add.
+    # `fit`'s answer: a Hash of its three keys, with the test of no variation beside each variance.
+    class Fit < Hash
+      attr_reader :variation_tests
+
+      def initialize(fields, variation_tests)
+        super()
+        @variation_tests = variation_tests
+        update(fields)
+      end
+    end
+
+    # One cell's pooled covariance, arm-major as `own`'s: the level shared by every arm with credit, each arm's delta
+    # its own, each block keeping its arm's correlation between parts.
+    class SharedLevel
+      # The rounding of one entry built, relative to the largest variance: the units of Float::EPSILON its quotients,
+      # products, square roots and one sum can add. Each of its two terms is at most its sds' product, and the two
+      # products together at most the geometric mean of the entry's diagonal (Cauchy-Schwarz).
       ENTRY_ROUNDING = 8 * Float::EPSILON
 
-      def initialize(own, variances)
+      # own: own's covariance rows; size: the parts; level_arm: the index of the arm whose parts give the level's
+      # correlation; level: Var(mu_p) per part; effects: { index of an arm with credit => Var(delta_ap) per part }, the
+      # reference arm's 0.0.
+      def initialize(own, size, level_arm, level, effects)
         @own = own
-        @variances = variances
+        @size = size
+        @level_arm = level_arm
+        @level = level
+        @effects = effects
         @from = own.each_index.map { |index| own[index][index].positive? ? Math.sqrt(own[index][index]) : 0.0 }
-        @to = variances.map { |variance| Math.sqrt(variance) }
+        @level_sds = level.map { |variance| Math.sqrt(variance) }
+        @effect_sds = effects.transform_values { |row| row.map { |variance| Math.sqrt(variance) } }
       end
 
-      # One triangle, mirrored, so it is exactly symmetric, the diagonal the variances themselves.
+      # One triangle, mirrored, so it is exactly symmetric; an arm with no credit keeps its rows and columns 0.0.
       def covariance
-        size = @variances.size
-        answer = Array.new(size) { Array.new(size, 0.0) }
-        size.times do |row|
-          answer[row][row] = @variances[row]
-          ((row + 1)...size).each do |column|
-            value = Read.number(correlation(row, column) * @to[row] * @to[column], "a pooled covariance")
+        answer = Array.new(@own.size) { Array.new(@own.size, 0.0) }
+        entries = @effects.keys.product((0...@size).to_a)
+        entries.each_with_index do |(arm, part), at|
+          row = (arm * @size) + part
+          answer[row][row] = Read.number(@level[part] + @effects[arm][part], "a pooled variance")
+          entries.drop(at + 1).each do |other, other_part|
+            column = (other * @size) + other_part
+            value = Read.number(entry(arm, part, other, other_part), "a pooled covariance")
             answer[row][column] = value
             answer[column][row] = value
           end
@@ -435,26 +478,51 @@ module SkiftetStatistical
         answer
       end
 
-      # own's bound on an entry, in the new units. The moved matrix is S * own * S, S the sds' ratios, so entry (i, j)'s
-      # error is its own times S_i * S_j, which the largest ratio twice bounds. A row whose own variance is 0 holds
-      # nothing to carry.
+      # own's bound on an entry, in the new units. The level's block is S * own's block * S, S the ratios of its sds to
+      # own's, and so is each arm's, so an entry's error is at most own's bound times the largest ratio of each block
+      # it holds, squared. A part whose own variance is 0 holds nothing to carry, and one part reads no entry of own.
       def rounding(own_rounding)
-        stretch = @from.zip(@to).map { |from, to| from.positive? ? to / from : 0.0 }.max || 0.0
-        carried = own_rounding * stretch * stretch
+        effect = @effects.map { |arm, sds| stretch(arm, @effect_sds.fetch(arm)) }.max || 0.0
+        carried = own_rounding * ((stretch(@level_arm, @level_sds)**2) + (effect**2))
+        largest = @effects.flat_map { |_arm, row| row.each_with_index.map { |variance, part| @level[part] + variance } }
 
-        Read.number(carried + (ENTRY_ROUNDING * (@variances.max || 0.0)), "the pooled rounding")
+        Read.number(carried + (ENTRY_ROUNDING * (largest.max || 0.0)), "the pooled rounding")
       end
 
       private
 
+      # Cov(mu_p, mu_q), with Cov(delta_ap, delta_aq) beside it within one arm (two parts of it, never one twice).
+      def entry(arm, part, other, other_part)
+        level = if part == other_part
+          @level[part]
+        else
+          correlation(@level_arm, part, other_part) * @level_sds[part] * @level_sds[other_part]
+        end
+        return level unless arm == other
+
+        level + (correlation(arm, part, other_part) * @effect_sds[arm][part] * @effect_sds[arm][other_part])
+      end
+
       # Rounding can take a correlation past 1, and it takes nothing the bound does not hold: the exact one is within 1.
-      def correlation(row, column)
+      def correlation(arm, part, other_part)
+        row = (arm * @size) + part
+        column = (arm * @size) + other_part
         scale = @from[row] * @from[column]
 
         scale.positive? ? (@own[row][column] / scale).clamp(-1.0, 1.0) : 0.0
       end
+
+      # The largest factor one arm's sds moved by from own's.
+      def stretch(arm, sds)
+        return 0.0 if arm.nil? || @size < 2
+
+        sds.each_with_index.map do |sd, part|
+          from = @from[(arm * @size) + part]
+          from.positive? ? sd / from : 0.0
+        end.max || 0.0
+      end
     end
-    private_constant :Rescale
+    private_constant :SharedLevel
 
     # One row of `baseline`, read and checked: its numbers Floats, its three squared sums filled in for one visit.
     class SumRow
@@ -633,6 +701,7 @@ module SkiftetStatistical
         @held = held
         @arm = arm
         @taus = {}
+        @spreads = {}
         @tree_effects = Array.new(design.parents.size)
         @key_means = design.groupings.map { |grouping| Array.new(grouping.keys.size, 0.0) }
         @key_variances = design.groupings.map { |grouping| Array.new(grouping.keys.size, 0.0) }
@@ -644,13 +713,21 @@ module SkiftetStatistical
           @design.groupings.each_index { |index| fit_grouping(index) }
           fit_tree
         end
-        return self if [ @node_means, @key_means, @taus.values ].flatten.all?(&:finite?)
+        return self if [ @node_means, @key_means, @taus.values, @spreads.values ].flatten.all?(&:finite?)
 
         raise ArgumentError, "the contrasts of arm #{@arm} overflow a Float"
       end
 
       def tau_squared(name)
         @taus.fetch(name)
+      end
+
+      # The last sweep's Q on its degrees, and the chance of one at least as large under tau^2 = 0.
+      def variation_test(name)
+        spread, degrees = @spreads.fetch(name)
+        p_value = degrees.positive? ? Significance.chi_squared_survival(spread, degrees) : 1.0
+
+        { statistic: spread, degrees: degrees, p_value: p_value }
       end
 
       def node_effect(node)
@@ -697,7 +774,7 @@ module SkiftetStatistical
           sum[key] += weight * (@estimates[cell] - @tree_means[cell] - other_keys(cell, index))
         end
 
-        tau_squared = current(grouping.name) { moment([ precision.zip(sum) ]) }
+        tau_squared = current(grouping.name, [ precision.zip(sum) ])
         precision.each_index do |key|
           scale = 1.0 + (tau_squared * precision[key])
           @key_means[index][key] = tau_squared * sum[key] / scale
@@ -751,9 +828,8 @@ module SkiftetStatistical
       end
 
       def level_tau(depth, precision, sum)
-        current(Design.level_name(depth)) do
-          moment(@design.sibling_sets[depth].values.map { |nodes| nodes.map { |node| [ precision[node], sum[node] ] } })
-        end
+        sets = @design.sibling_sets[depth].values.map { |nodes| nodes.map { |node| [ precision[node], sum[node] ] } }
+        current(Design.level_name(depth), sets)
       end
 
       def spread_down(up_precision, up_sum, sent_precision, sent_sum)
@@ -786,14 +862,17 @@ module SkiftetStatistical
         [ tau_squared * ((a_sum * b) - (b_sum * a)) / total, tau_squared * (a + b) / total ]
       end
 
-      # The variance `variances:` holds, or the block's moment: from here on the current one.
-      def current(name)
-        @taus[name] = @held.fetch(name) { yield }
+      # The variance `variances:` holds, or the moment on `sets`: from here on the current one. The spread and its
+      # degrees are kept for the test either way.
+      def current(name, sets)
+        spread, degrees, scale = spread_of(sets)
+        @spreads[name] = [ spread, degrees ]
+        @taus[name] = @held.fetch(name) { scale.positive? ? [ (spread - degrees) / scale, 0.0 ].max : 0.0 }
       end
 
-      # tau^2 by moments over sets of groups, each set around its own weighted mean, a group being [precision,
-      # precision * estimate]. A group with no contrast is left out.
-      def moment(sets)
+      # The moment's sums over sets of groups, each set around its own weighted mean, a group being [precision,
+      # precision * estimate]: [spread, degrees, scale]. A group with no contrast is left out.
+      def spread_of(sets)
         spread = 0.0
         degrees = 0
         scale = 0.0
@@ -807,7 +886,7 @@ module SkiftetStatistical
           degrees += groups.size - 1
           scale += total - (groups.sum(0.0) { |precision, _sum| precision * precision } / total)
         end
-        scale.positive? ? [ (spread - degrees) / scale, 0.0 ].max : 0.0
+        [ spread, degrees, scale ]
       end
     end
     private_constant :ArmFit
