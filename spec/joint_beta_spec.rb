@@ -45,6 +45,16 @@ RSpec.describe SkiftetStatistical::JointBeta do
         expect { described_class.each_draw(posteriors, draws: draws, rng: Random.new(1)) }.to raise_error(ArgumentError)
       end
     end
+
+    it "refuses a parameter that is not above 0 at its first draw, as Sampler's ArgumentError, and 0 draws read none" do
+      [ [ 0.0, 2.0 ], [ 2.0, -1.0 ], [ Float::NAN, 2.0 ] ].each do |pair|
+        broken = [ [ 3.0, 4.0 ], pair ]
+        expect { described_class.each_draw(broken, draws: 1, rng: Random.new(1)) { nil } }
+          .to raise_error(ArgumentError, "shape must be > 0"), pair.inspect
+        expect { described_class.summary(broken, draws: 1, rng: Random.new(1)) }.to raise_error(ArgumentError), pair.inspect
+        expect(described_class.each_draw(broken, draws: 0, rng: Random.new(1)).to_a).to eq([]), pair.inspect
+      end
+    end
   end
 
   describe ".summary" do

@@ -53,6 +53,10 @@ Modules:
 - **`Cusum`** — a one-sided change test: its statistic, its run length, the
   threshold for a stated false-alarm rate and the smallest change it can see.
 
+The methods an application calls, each with what it takes, answers, guarantees
+and refuses, are under [Interface contract](#interface-contract); what a
+version number promises about seeded answers is under [Stability](#stability).
+
 ## Install
 
 In a Gemfile (published on rubygems.org):
@@ -68,6 +72,24 @@ cd skiftet_statistical
 bundle install
 gem build skiftet_statistical.gemspec
 ```
+
+## Stability
+
+The version follows [semantic versioning](https://semver.org), with one rule
+made explicit for a statistics library: **a seeded answer is part of the
+public API.** A release that moves an answer for the same inputs, the same
+key and the same RNG seed (a draw, an order, a pick, a pinned figure, a
+p-value beyond its stated tolerance) is a major or a minor version, as its
+CHANGELOG entry states (before 1.0, as semver allows, a minor one), and that
+entry says which answers move and why. It is never a patch: a patch release
+fixes documentation, adds examples, or turns a crash into the refusal the
+documentation states, and moves no answer. Adding a method, or a keyword whose
+default keeps every old answer, is a minor version.
+
+The pins in `spec/pins` are literal values recorded when each behaviour was
+built and never edited: a change that fails one has moved a public answer, and
+ships only as the version above. The methods an application calls, with what
+each guarantees, are listed under [Interface contract](#interface-contract).
 
 ## Descriptive statistics
 
@@ -1326,6 +1348,458 @@ Measured (`change_test_simulation_spec.rb`, below): a stated one false alarm in
 (stated 0.25), each inside its 95 % binomial interval; a shift of the minimum
 detectable size was caught within the horizon in 62 to 66 % of runs (bound
 half).
+
+## Interface contract
+
+The methods an application calls, each with what it takes, what it answers,
+what holds of the answer and what it refuses, so a caller can rely on the
+method without pinning its outputs in its own suite. An app tests that it hands
+these methods the right inputs and uses their answers; the library tests that
+the answers are right. Every guarantee below is backed by a library example:
+`spec/interface_contract_spec.rb` indexes them, method by method, and fails
+when a cited example is gone or a method below is no longer public. If a
+guarantee you need is missing here, ask for it to be stated and tested in the
+library rather than pinning it in your app.
+
+Conventions:
+
+- **Refused** means an `ArgumentError` raised before anything is computed or
+  taken from an RNG, unless the entry says otherwise.
+- **Numbers** are read by the library's one number reader where the entry says
+  so: a finite real number of magnitude at most 1e100 (`Numbers::LARGEST`); a
+  String, a numeric one included, is not a number.
+- **Determinism** comes in three kinds, and each entry says which:
+  - *keyed*: SHA256 and Integer arithmetic only, so the same parts give the
+    same answer in every process, on every machine and on every Ruby version;
+  - *seeded*: the same RNG stream gives the same answer, the library taking
+    values from it in a stated order (`Random.new(seed)` gives the same stream
+    on every Ruby the CI runs, 3.1 to 3.4);
+  - *exact*: no randomness at all; the same inputs give the same Float on one
+    platform, and where the computation goes through `Math.lgamma` another math
+    library can move the last bits (the pins compare such figures at 1e-9
+    relative, and orders, heads, branches and counts exactly, on every Ruby the
+    CI runs).
+
+### Posterior sets (`Bandit::Posteriors`)
+
+#### `Bandit::Posteriors.yes_no(items, priors: nil)`
+
+- Takes: `items`, a Hash of item name => tally, the names non-blank Strings in
+  the tie order; a tally `{ views:, outcomes: }` (Symbol or String keys,
+  numbers >= 0, fractional allowed; optionally `weighted_views`,
+  `weighted_outcomes` and `weighted_views_squared`); `priors` nil (Beta(1, 1)),
+  one pair `[alpha, beta]` (each >= 0) or `{ item => pair }` naming every item.
+- Answers: a set, `kind` `:beta`, `parameters` `{ item => [alpha + c, beta + n - c] }`
+  with c the outcomes clamped to [0, views] (or the weighted outcomes rescaled
+  to the Kish size, never above the views), a pair whose total is above
+  `LARGEST_TOTAL` (1e6) scaled to it with its mean kept; `views` the tallies'
+  views as Floats.
+- Guarantees: plain arithmetic, so the same tallies build the same pairs bit
+  for bit everywhere; an item's pair is its own tally's and prior's alone; a
+  set built from another set's `parameters` keeps them bit for bit; the same
+  rule as `WeightedPosterior.beta`; any number of items, none included. A set
+  is a value: `items`, `kind`, `parameters` and `views` are frozen and no
+  reader (`rank`, `pick`, `Order#repin`, `summary`, `means`, `values`,
+  `greedy`) writes to it, so one set may be built once and read from many
+  requests and threads (the order and position odds keep a memo on a set its
+  caller has not frozen; a frozen set answers alike).
+- Refuses: `items` that is not a Hash; a name that is not a String, is blank,
+  is given twice, holds a NUL byte or an earlier name's bytes; a count below 0,
+  not a number or beyond 1e100; a Hash of priors naming a name that is not an
+  item or leaving one out; a pair not above 0 once the tally is added.
+
+#### `Bandit::Posteriors.beta(pairs, views: nil)`
+
+- Takes: `pairs`, a Hash of item name => `[alpha, beta]`, each a finite number
+  above 0; `views` nil (every item 0) or `{ item => views >= 0 }`, an item it
+  leaves out reading 0.
+- Answers: a `:beta` set holding the pairs as given (scaled in `parameters`
+  only above `LARGEST_TOTAL`; `summary`'s means and intervals read them as
+  given). `normal(pairs, views:)` is the same for `[mean, standard deviation]`.
+- Guarantees: as `yes_no`'s set: a value, frozen, read by no reader's writes.
+- Refuses: the names `yes_no` refuses; a parameter that is not a finite number
+  above 0; views naming a name that is not an item, or below 0.
+
+#### `Bandit::Posteriors.amounts(items, priors:)`
+
+- Takes: tallies `{ views:, outcomes:, outcome_squares: }` (the outcomes the
+  sum of amounts, any sign) under one `Prior::Amount` or one an item.
+- Answers: a `:normal` set of `[mean, standard deviation]` for the mean per
+  view.
+- Refuses: as `yes_no`, and a prior that is not a `Prior::Amount` (there is no
+  flat amounts prior).
+
+#### `Bandit::Posteriors#parameters`
+
+- Answers: `{ item => pair }`, frozen: the one pair every draw (`rank`, `pick`,
+  `values`, from any source), every odds call, `summary`'s P(best) and loss and
+  `greedy` read.
+- Guarantees: unchanged by every reader; a Beta pair above `LARGEST_TOTAL` is
+  scaled to it with its mean kept, never summing above it.
+
+#### `Bandit::Posteriors#rank(key: | uniforms: | rng:, shuffle: 0.0, explore: 0.0, may_lead: nil, min_views: 0.0, pinned: {}, top: nil)`
+
+- Takes: exactly one source: `key:` (a String, or an Array of parts: nil, a
+  String, or anything whose `to_s` answers a String, none holding a NUL byte),
+  `uniforms:` or `rng:` (answering `rand` with Floats in [0, 1)); `shuffle` and
+  `explore` in [0, 1] summing to at most 1; `may_lead` nil or a list of item
+  names; `min_views` a number (one below 0 asks for none, as 0 does); `pinned`
+  `{ Integer position => item }` (0-based); `top` nil or an Integer >= 1.
+- Answers: a frozen `Order`: `items` (the first `top`, pinned items at their
+  positions), `leader` (the free head when it has `min_views` views, else nil),
+  `branch` (`:shuffled`, `:explored` or `:thompson`) and `draws` (each free
+  item's posterior value; none on the shuffled branch).
+- Guarantees:
+  - A key draws the same Order from the same set in every process (*keyed*
+    uniforms, `Draw.uniform_for(*key, "explore")`, `(*key, "priority", item)`
+    and `(*key, "draw", item)`; the draws are their quantiles on `parameters`,
+    *exact*).
+  - An item's uniforms are the key's and its own name's alone: with no pin, an
+    added item never changes the others' relative order, and an added item
+    that `may_lead` does not name changes neither the others' order, the leader
+    nor the branch. `may_lead`, `min_views`, `shuffle` and `explore` choose the
+    head, the branch and the leader; the items after the head follow by draw
+    (by priority on the shuffled branch).
+  - From an RNG (*seeded*): exactly one branch value (when shuffle + explore is
+    above 0), one priority per free item on the shuffled or explored branch,
+    then one `Sampler` draw per free item where the branch draws, in item
+    order, and nothing else from the stream.
+  - Every source draws exactly from the posteriors, so the pick, order and
+    position odds describe each of them. Ties go to the earlier item. Pinned
+    items keep their positions and draw nothing. The set is not changed.
+- Refuses, before any draw and before anything is taken from an RNG: a rule
+  outside its bounds, a pinned position or name that is not an item, a name
+  pinned twice, a `may_lead` name that is not an item, `top` below 1, no source
+  or two, a malformed `uniforms` Hash, a key part holding a NUL byte or whose
+  `to_s` answers no String, and under a key or given uniforms a Beta parameter
+  below 1e-6. An RNG answer that is not a Float in [0, 1), or a raise from its
+  `rand`, is an `ArgumentError` at that answer.
+
+#### `Bandit::Posteriors#pick(key: | uniforms: | rng:, shuffle: 0.0, explore: 0.0, may_lead: nil, min_views: 0.0)`
+
+- Answers: a frozen `Choice`: `item` (the leader, nil when the head has fewer
+  than `min_views` views), `head`, `branch` and `draws`; nil, nil and no draws
+  for an empty set.
+- Guarantees: `rank`'s; under every source it is the head of the Order `rank`
+  answers there, an RNG giving up exactly the values `rank` takes.
+- Refuses: what `rank` refuses.
+
+#### `Bandit::Order#repin(pinned)`
+
+- Takes: `{ Integer position => item }`.
+- Answers: the Order `rank` answers on the same set and the same key or given
+  uniforms with these pins under the held rule (shuffle 0, explore 0, no
+  `may_lead`, `min_views` 0, the order's own `top`), `==` and every draw.
+- Guarantees: an item the order drew keeps its draw and is not drawn again, so
+  re-pinning an order's own head first draws nothing at all; the source is the
+  one `rank` read, so a caller's object changed after `rank` moves no re-pin;
+  neither the order nor its set changes.
+- Refuses: an order drawn from an RNG, one no posterior set made, and what
+  `rank` refuses on that source.
+
+#### `Bandit::Posteriors#summary(credible_mass: 0.95, among: nil)`
+
+- Takes: `credible_mass` above 0 and below 1; `among` nil (every item), `[]`
+  (none: means and intervals only, any number of items) or a list of at most
+  `EXACT_PICK_MAX` (20) item names.
+- Answers: `{ item => { views:, mean:, lower:, upper:, p_best:, expected_loss: } }`
+  in item order, `p_best` and `expected_loss` nil for an item `among` does not
+  name; the shape `Allocator.from_summary` reads.
+- Guarantees (*exact*): no key, uniform or RNG is read, so the same set answers
+  the same summary bit for bit on every call whatever the process's random
+  state; an item's views, mean and interval are its own pair's alone (the pair
+  as given, never the scaled one), so the item answers them alike in any set
+  that holds it, a set of its own included; the interval's ends are
+  `BetaFunction.quantile`'s at (1 - mass) / 2 and 1 less that (its accuracy
+  below), or the Normal's mean -+ z sd; P(best) is within 1e-12 of
+  `BetaArgmax.probabilities` (`NormalArgmax`'s for a Normal set) among the
+  named items only, and the loss is never below 0.
+- Refuses: a `credible_mass` outside (0, 1); an `among` that is not a list,
+  names a name that is not an item or names more than 20; a Beta parameter
+  below 1e-6 (on the pair as given, on every path; on the scaled pair when
+  `among` names an item).
+
+#### `Bandit::Posteriors#means`
+
+- Answers: `{ item => mean }`, frozen, in item order: `summary`'s `:mean`, bit
+  for bit.
+- Guarantees (*exact*): no quantile, no draw and no randomness, for a set of
+  any size.
+- Refuses: nothing a built set holds.
+
+### Priors (`Bandit::Prior`)
+
+#### `Bandit::Prior.flat`
+
+- Answers: `[1.0, 1.0]`, the same frozen Array on every call.
+
+#### `Bandit::Prior.borrowed(group:, own: nil)`
+
+- Takes: two yes/no tallies `{ views:, outcomes: }`; nil reads as no evidence.
+- Answers: `{ views:, outcomes: }`, the group less the item's own, views at
+  least 0 and outcomes within [0, views].
+- Guarantees: the one leave-one-out rule `pooled` and `pooled_new` borrow by.
+- Refuses: a tally that is not a Hash or nil; a count below 0, not a number or
+  beyond 1e100.
+
+#### `Bandit::Prior.pooled(group:, own: nil, strength:, base: Prior::FLAT)`
+
+- Takes: two tallies, a `strength` >= 0 in views, a `base` pair above 0.
+- Answers: `[alpha, beta]`: the borrowed mean (base_alpha + y) /
+  (base_alpha + base_beta + n) held at base_alpha + base_beta +
+  min(strength, n); the base itself when nothing is borrowed.
+- Guarantees: plain arithmetic, the mean formed exactly and rounded once, so
+  the same inputs answer the same pair bit for bit everywhere.
+- Refuses: a `base` that is not a pair above 0, then a `strength` below 0 or
+  not a number (`"strength must be >= 0 (got -1.0)"`), whatever the tallies
+  hold, a nil group included; then what `borrowed` refuses.
+
+#### `Bandit::Prior.pooled_new(others:, group: nil, own: nil, weight: 2.0)`
+
+- Takes: `others`, a list of `{ group:, own: }`; the new item's own tallies; a
+  `weight` >= 0.
+- Answers: `[alpha, beta]`: the others' borrowed evidence pooled into
+  (1 + Y) / (2 + N) at `weight`, plus the new item's own borrowed evidence;
+  Beta(1, 1) with no others and no group.
+- Refuses: a `weight` below 0, `others` that is not a list of Hashes, and what
+  `borrowed` refuses of any tally.
+
+### Keyed randomness (`Bandit::Draw`, `Bandit::Decay`)
+
+#### `Bandit::Draw.seed_for(*parts)`
+
+- Takes: parts, each nil (read as ""), a String (its bytes) or anything whose
+  `to_s` answers a String (so 7 and "7" are one part).
+- Answers: an Integer in [0, 2**64): the first 8 bytes of SHA256 of the parts'
+  bytes joined by one NUL byte, big-endian, for `Random.new`.
+- Guarantees (*keyed*): the same Integer in every process, on every machine
+  and every Ruby version (unlike `String#hash`, which Ruby seeds per process);
+  two different part lists never join to the same text.
+- Refuses: a part holding a NUL byte, and a part whose `to_s` answers no
+  String.
+
+#### `Bandit::Draw.uniform_for(*parts)`
+
+- Answers: `seed_for`'s top 53 bits over 2**53, a Float in [0, 1).
+- Guarantees and refusals: `seed_for`'s.
+
+#### `Bandit::Draw.from_weights(weights, uniform)`
+
+- Takes: a Hash of key => weight (keys any objects) and a uniform in [0, 1].
+- Answers: the first key, in input order, whose running sum of counted weights
+  reaches uniform * total (the last counted key when rounding leaves the sum
+  short); nil for an empty Hash.
+- Guarantees: pure; a weight that is not a finite number above 0 counts 0 and
+  is never answered; with no positive weight every key counts 1; a uniform
+  drawn uniformly answers a key with probability its counted weight over the
+  total; keys are answered as given and never read.
+- Refuses: weights that are not a Hash, a uniform outside [0, 1], a weight
+  beyond 1e100, and counted weights whose sum is not finite.
+
+#### `Bandit::Decay.weight(age, half_life:, cap: nil)`
+
+- Answers: 2 ** (-age / half_life); 0.0 above the cap (inclusive at it).
+- Guarantees (*exact*): no clock of its own; 1.0 at age 0, 0.5 at one half-life.
+- Refuses: a negative age, a half-life not above 0, a cap below 0.
+
+#### `Bandit::Decay.fold(rows, half_life:, cap: nil)`
+
+- Answers: `{ views:, outcomes:, outcome_squares: }` summed over rows, each
+  row's sums at its age's weight; linear in the rows, so rows summed by age
+  first fold alike.
+- Refuses: a row without an age or with a negative one, and what the tally
+  reader refuses.
+
+### A/B allocation (`Bandit::Allocator`, `Bandit::WinHold`, `Bandit::WeightedPosterior`)
+
+#### `Bandit::Allocator::Config.new(**settings)`
+
+- Takes: any of `warmup_exposures`, `floor`, `max_step`, `win_p_best`,
+  `win_loss`, `won_share`, `won_rest`, `result_changed_below`,
+  `credible_mass`, `prior_alpha` and `prior_beta` by keyword; one left out is
+  its `DEFAULTS` value.
+- Answers: a frozen value, `==` by its settings.
+- Guarantees: every setting is read by the decision it names, at every call
+  handed this Config, and from nowhere else.
+- Refuses: a name that is not a setting, a value that is not a finite number, a
+  floor outside (0, 1].
+
+#### `Bandit::Allocator.call(arms:, tallies:, status:, winner_arm:, rng:, draws:, previous_weights: nil, hold_satisfied: true, config: Config.new, fixed_shares: nil, arm_floors: nil)`
+
+- Takes: 1 to `config.max_arms` arms (Symbols or Strings); tallies
+  `{ arm => { exposures:, conversions: } }` (Symbol or String keys, optionally
+  the weighted sums and guardrails); status `"running"`, `"paused"` or `"won"`;
+  an RNG; a whole number of joint draws.
+- Answers: `{ weights:, phase:, stats:, winner:, result_changed:, leader: }`,
+  arms as Symbols.
+- Guarantees (*seeded*): pure, no clock and no state; the same inputs and the
+  same RNG stream answer the same result, the joint draws taken arm by arm in
+  the given order (`JointBeta`); the inputs are not changed; `hold_satisfied`
+  moves only the crown (weights, phase, winner), never `stats`; every setting
+  read is the `config`'s. The pinned fixtures answer alike on every Ruby the CI
+  runs.
+- Refuses, before any draw: a config that is not a `Config`, no arms or more
+  than `config.max_arms`, `draws` below 1 once read by `Integer()` (whose own
+  error a value it cannot read raises), the per-arm share checks, and
+  `allocation: :fixed` (`FixedAllocation`, an `ArgumentError`).
+
+#### `Bandit::Allocator.won_weights(arms, winner, config: Config.new)`
+
+- Answers: the winner `config.won_share`, every other arm
+  `config.won_rest / (arms.size - 1)`, keyed by the arms as given; a single arm
+  1.0.
+- Guarantees: pure arithmetic; the config's two settings are the ones read.
+- Refuses: nothing of its own: a winner that is not one of the arms is not
+  checked (every arm then gets its `won_rest` share), and a config that is not
+  a `Config` raises `NoMethodError`.
+
+#### `Bandit::Allocator.lift(weights, config: Config.new)`
+
+- Answers: every arm at least `config.floor`, the others scaled in proportion
+  into what the pinned floors leave, keys as given.
+- Guarantees: 0.2.0's private `Allocator#with_floor`, step for step, in public.
+  `with_floor` itself stays private and carries no promise: call `lift`.
+- Refuses: weights that are not a Hash of 1 to `max_arms` arms, a config that
+  is not a `Config`, a share that is not a finite number.
+
+#### `Bandit::WinHold.new(leading_arm:, leading_since:, now:, last_pass_at:, hold_seconds: 86_400, max_gap_seconds: 1_200)`
+
+- Takes: any arm (a blank one reads as none, any other is kept as a String);
+  clock values that are Times, numbers of seconds or anything whose difference
+  compares with the two lengths; `leading_since` and `last_pass_at` may be nil.
+- Guarantees: pure, no clock of its own; the two lengths given are the two
+  read.
+- Refuses: nothing of its own: leaving out a required keyword (`last_pass_at`
+  included) is Ruby's `ArgumentError`, and a clock value that cannot be
+  subtracted raises its own error when the hold is first asked.
+
+#### `Bandit::WinHold#satisfied?`
+
+- Answers: true from exactly `hold_seconds` after `leading_since`; false with
+  no leader, no `leading_since`, or a run interrupted (no previous pass, or one
+  more than `max_gap_seconds` ago; a gap of exactly `max_gap_seconds` is
+  unbroken).
+
+#### `Bandit::WinHold#satisfied_for?(arm)`
+
+- Answers: `satisfied?` and `arm`, by its String form, is the arm that held.
+
+#### `Bandit::WinHold#after_pass(leader)`
+
+- Answers: `{ leading_arm:, leading_since: }`: unchanged while the same arm
+  leads an unbroken run; the leader from `now` for another arm, after a gap or
+  without `leading_since`; both nil with no leader.
+
+#### `Bandit::WeightedPosterior.count(tally)`
+
+- Takes: a Hash with Symbol or String keys, or nil (nobody seen); anything
+  else raises `NoMethodError`.
+- Answers: `{ exposures:, conversions:, weighted_exposures:,
+  weighted_conversions:, weighted_exposures_squared: }`, the weighted sums kept
+  only when both are given and the weighted exposures are above 0, the squared
+  sum only beside them and above 0.
+- Guarantees: 0.2.0's reading, kept as it was: the counts by `Kernel#Integer`
+  (a Float truncates toward 0, a numeric String reads as its number), the
+  weighted sums by `to_f`.
+- Refuses: what `Integer()` cannot read raises `Integer()`'s own error: an
+  `ArgumentError` for a String that is no number, a `TypeError` for an Array or
+  another object, a `FloatDomainError` for NaN or an infinity.
+
+#### `Bandit::WeightedPosterior.beta(count, prior_alpha: 1.0, prior_beta: 1.0)`
+
+- Answers: `[prior_alpha + c, prior_beta + n - c]`, n `effective_exposures`, c
+  the conversions (or the weighted conversions rescaled to n) clamped to
+  [0, n].
+- Guarantees: plain arithmetic; `Posteriors.yes_no` reads a tally by the same
+  rule.
+- Refuses: a negative exposure count, as an `ArgumentError`.
+
+#### `Bandit::WeightedPosterior.effective_exposures(count)`
+
+- Answers: the raw count (an Integer) without a squared sum, else the Kish n
+  (sum w)^2 / sum w^2, never above the raw count.
+
+### Joint draws, distribution functions and tests
+
+#### `JointBeta.each_draw(posteriors, draws:, rng:)`
+
+- Takes: a list of `[alpha, beta]` pairs, each above 0; an Integer >= 0 of
+  draws; an RNG.
+- Answers: one Array per draw (one Float per arm, in order), yielded, or an
+  Enumerator of them without a block.
+- Guarantees (*seeded*): the same pairs, draws and stream give the same rows;
+  per draw, arm by arm in the given order, one `Sampler#beta` each, so adding,
+  dropping or reordering an arm moves every later draw.
+- Refuses: `draws` that is not an Integer >= 0 (before anything is drawn), and
+  a parameter that is not above 0 at its first draw (`Sampler`'s
+  `"shape must be > 0"`; with 0 draws nothing is read).
+
+#### `JointBeta.summary(posteriors, draws:, rng:)`
+
+- Answers: `{ samples:, wins:, losses: }` over the same rows as `each_draw`, a
+  tie's win split equally between the tied arms.
+- Guarantees and refusals: `each_draw`'s.
+
+#### `BetaFunction.regularized(x, alpha, beta)`
+
+- Answers: I_x(alpha, beta), the Beta distribution function; 0.0 for x <= 0
+  and 1.0 for x >= 1.
+- Guarantees (*exact*): for parameters up to a few hundred, within 5e-12
+  relative of an exact binomial reference. For parameters from 1 000 to
+  50 000 each (n = alpha + beta), within 4 n ln n machine epsilons, relative
+  (about 1e-9 at n = 100 000), where the identities I_x(a, b) + I_(1-x)(b, a) = 1
+  and I_(1/2)(a, a) = 1/2 hold to the same bound. Beyond a total of about
+  3 * 10**8 the continued fraction's fixed bound binds (see `summary`).
+- Refuses: alpha or beta whose `to_f` is not a finite number above 0, and an x
+  whose `to_f` is NaN (each read by `to_f`, as `Gamma` reads its arguments).
+
+#### `BetaFunction.quantile(probability, alpha, beta)`
+
+- Answers: the x where I_x(alpha, beta) = probability, by bisection to a
+  Float's spacing; 0.0 at and below 0, 1.0 at and above 1.
+- Guarantees (*exact*): `regularized(quantile(p))` is p within `regularized`'s
+  bound; at parameters from 1 000 to 50 000 the 2.5 % and 97.5 % quantiles lie
+  within 0.001 sd of the normal approximation with its first skewness term.
+- Refuses: as `regularized`, for the probability.
+
+#### `Gamma.regularized_lower(a, x)`
+
+- Answers: P(a, x), the Gamma(a, 1) distribution function; 0.0 for x <= 0.
+- Guarantees (*exact*): within 5e-12 relative of the exact Poisson sums for
+  whole a up to 200, on both sides of x = a + 1; P + Q = 1.
+- Refuses: an a whose `to_f` is not a finite number above 0, and an x whose
+  `to_f` is NaN (both are read by `to_f`, so a numeric String reads as its
+  number, a non-numeric one as 0.0, and an object without `to_f` raises
+  `NoMethodError`).
+
+#### `Gamma.regularized_upper(a, x)`
+
+- Answers: Q(a, x) = 1 - P(a, x); 1.0 for x <= 0.
+- Guarantees and refusals: `regularized_lower`'s.
+
+#### `Significance.normal_quantile(p)`
+
+- Answers: the z with Phi(z) = p; -Infinity at 0 and Infinity at 1.
+- Guarantees (*exact*): z maps back to p within 1e-12 relative, from p = 1e-300
+  to 1 - 1e-6.
+- Refuses: a p outside [0, 1], NaN included.
+
+#### `Significance.chi_squared_survival(statistic, degrees_of_freedom)`
+
+- Answers: P(X >= statistic) for X ~ chi-squared(degrees_of_freedom), Q(dof / 2,
+  statistic / 2); 1.0 for a statistic of 0 or below.
+- Refuses: degrees of freedom not above 0 (for a statistic above 0).
+
+#### `Significance.sample_ratio_p_value(observed:, expected:, minimum_total: 200)`
+
+- Takes: Hashes of arm => count and arm => expected count (Symbol or String
+  keys, as `observed`'s); `minimum_total`, read as given above or below its
+  default.
+- Answers: Pearson's chi-squared p on k - 1 degrees of freedom over the arms
+  expected to get traffic; nil under `minimum_total` or with fewer than two
+  such arms; 0.0 when an arm expected to get nothing got some.
+- Guarantees (*exact*): `chi_squared_survival`'s accuracy.
+- Refuses: nothing of its own (a non-Hash raises `NoMethodError`).
 
 ## Bandit simulations: measured results
 

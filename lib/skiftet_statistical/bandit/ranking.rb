@@ -112,6 +112,28 @@ module SkiftetStatistical
       private_constant :RANK_QUANTILE_DRAW
 
       # The posterior set's items in the order the rule draws: an Order.
+      #
+      # Takes (the class comment's rule): exactly one of `key:` (a String, or an Array of parts: nil, a String, or
+      # anything whose to_s answers a String, none holding a NUL byte), `uniforms:` or `rng:` (answering rand with
+      # Floats in [0, 1)); `shuffle` and `explore` in [0, 1] summing to at most 1; `may_lead` nil or a list of item
+      # names; `min_views` a number in the input domain (one below 0 asks for none, as 0 does); `pinned` a Hash of
+      # Integer position (0-based) => item name; `top` nil or an Integer of at least 1.
+      # Answers: a frozen Order (`items`, `leader`, `branch`, `draws`), and writes nothing to the set.
+      # Guarantees:
+      # - A key draws the same Order from the same set in every process: its uniforms are Draw.uniform_for of the
+      #   key's parts (SHA256, identical on every machine and Ruby version), and its draws their Beta or Normal
+      #   quantiles on `parameters`, whose last bits rest on the math library's lgamma (the pins compare a draw at
+      #   1e-9 relative, and an order, a leader and a branch exactly).
+      # - An item's uniforms are the key's and its own name's alone: with no pin, an added item never changes the
+      #   others' relative order, and an added item that `may_lead` does not name changes neither the others' order,
+      #   the leader nor the branch. `may_lead`, `min_views`, `shuffle` and `explore` choose the head, the branch and
+      #   the leader; the items after the head follow by draw (by priority on the shuffled branch) whatever they are.
+      # - An RNG gives the same Order for the same stream: the rule takes from it exactly one branch value (when
+      #   shuffle + explore is above 0), one priority per free item on the shuffled or explored branch, then one
+      #   Sampler draw per free item where the branch draws, in item order, and nothing else.
+      # - Every source draws exactly from the posteriors, so the order and pick odds describe each of them.
+      # Refuses: the class comment's list, each an ArgumentError before any draw and before anything is taken from an
+      # RNG; an RNG's answer that is not a Float in [0, 1), or a raise from its rand, is an ArgumentError at that answer.
       def rank(key: nil, uniforms: nil, rng: nil, shuffle: 0.0, explore: 0.0, may_lead: nil, min_views: 0.0,
                pinned: {}, top: nil)
         rule = rank_rule(shuffle: shuffle, explore: explore, may_lead: may_lead, min_views: min_views, pinned: pinned,
@@ -120,6 +142,11 @@ module SkiftetStatistical
       end
 
       # The head of the order rule (`rank` with top 1 and no pins): a Choice.
+      #
+      # Takes `rank`'s source and rule, without `pinned` and `top`. Answers a frozen Choice: `item` (the leader: the
+      # head when it has at least `min_views` views, else nil), `head`, `branch` and `draws` (every free item's draw,
+      # none on the shuffled branch). Guarantees `rank`'s: under every source it is the head of the Order `rank`
+      # answers there, an RNG giving up exactly the values `rank` takes. Refuses what `rank` refuses.
       def pick(key: nil, uniforms: nil, rng: nil, shuffle: 0.0, explore: 0.0, may_lead: nil, min_views: 0.0)
         rule = rank_rule(shuffle: shuffle, explore: explore, may_lead: may_lead, min_views: min_views, pinned: {},
                          top: nil)
@@ -535,6 +562,11 @@ module SkiftetStatistical
       # key>, pinned: pinned, top: <its top>)`, or the same with its given uniforms, bit for bit, computed on the draws
       # this order made (an item it did not draw is drawn now). An ArgumentError for an order drawn from an RNG, one no
       # posterior set made, and whatever `rank` refuses there.
+      #
+      # Guarantees: the answer is `rank`'s on the same set, source and pins, `==` and every draw; an item this order
+      # drew keeps its draw and is not drawn again, so re-pinning an order's own head first draws nothing at all; the
+      # source is the one `rank` read (each key part's bytes, each given number), so a caller's object changed after
+      # `rank` moves no re-pin. Neither the order nor its set is changed.
       def repin(pinned)
         unless Posteriors === @posteriors && Hash === @rule
           raise ArgumentError, "a #{Inputs.class_name(self)} is re-pinned only when a posterior set made it (it " \

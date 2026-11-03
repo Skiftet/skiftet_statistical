@@ -110,6 +110,33 @@ RSpec.describe "SkiftetStatistical::Bandit::Posteriors summaries" do
       end
     end
 
+    # No figure of a summary is drawn: the same set answers the same summary bit for bit on every call, whatever the
+    # process's random state, and an item's views, mean and interval are its own pair's alone, so the item answers them
+    # alike in a set of its own and beside any other items (only P(best) and the loss read the items named with it).
+    it "LO3 is exact and per item: the same answer under any seed, an item's interval its own pair's in any set" do
+      set = posteriors.beta(oracle::THREE, views: oracle::THREE_VIEWS)
+      kept = srand(1)
+      first = set.summary
+      means_only = set.summary(among: [])
+      srand(2)
+      Random.rand
+      again = set.summary
+      again_means_only = set.summary(among: [])
+      srand(kept)
+
+      expect(again).to eq(first)
+      expect(again_means_only).to eq(means_only)
+      wider = posteriors.beta(oracle::THREE.merge("w" => [ 30.0, 70.0 ], "v" => [ 2.0, 2.0 ]))
+      oracle::THREE.each do |item, pair|
+        alone = posteriors.beta({ item => pair }, views: { item => oracle::THREE_VIEWS[item] }).summary(among: [])
+        expect(alone.fetch(item)).to eq(means_only.fetch(item)), item
+        expect(wider.summary(among: []).fetch(item).slice(:mean, :lower, :upper))
+          .to eq(means_only.fetch(item).slice(:mean, :lower, :upper)), item
+        expect(first.fetch(item).slice(:views, :mean, :lower, :upper))
+          .to eq(means_only.fetch(item).slice(:views, :mean, :lower, :upper)), item
+      end
+    end
+
     it "LO3 (LC2) reads credible_mass: 0.9 at the 0.05 and 0.95 quantiles, and 0.95 by default" do
       set = posteriors.beta(oracle::THREE)
       narrow = set.summary(credible_mass: 0.9)

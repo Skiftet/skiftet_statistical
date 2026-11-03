@@ -14,6 +14,13 @@ module SkiftetStatistical
     # under a small share holds no more evidence than it has. n is the Kish effective sample size
     # (sum w)^2 / sum w^2 when the squared sum is present, never more than the raw count; else the raw exposure
     # count. Without the weighted sums the raw counts are judged.
+    #
+    # Guarantees: plain arithmetic, no randomness, so the same tally answers the same pair bit for bit everywhere;
+    # Bandit::Posteriors.yes_no reads a tally by the same rule (one rule, held equal by its specs). This is 0.2.0's
+    # reading, kept as it was: the counts by Kernel#Integer (a Float truncates toward 0, a numeric String reads as its
+    # number), the weighted sums by to_f. Refuses: what Integer() cannot read raises Integer()'s own error (an
+    # ArgumentError for a String that is no number, a TypeError for an Array or another object, a FloatDomainError for
+    # NaN or an infinity); `beta` refuses a negative exposure count as an ArgumentError.
     module WeightedPosterior
       module_function
 

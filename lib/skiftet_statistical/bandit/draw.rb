@@ -9,7 +9,10 @@ module SkiftetStatistical
   class Bandit
     # The randomness helpers, each written once: a text becomes a uniform, a list of parts becomes a uniform or a
     # seed, and a uniform picks a key by weight. Pure: the same text gives the same uniform in every process, on every
-    # machine, so a caller can key a draw by a visit, a pass or a test and get it back without storing it.
+    # machine and on every Ruby version (SHA256 and Integer arithmetic only, no Float function and no Ruby hash seed),
+    # so a caller can key a draw by a visit, a pass or a test and get it back without storing it. A uniform or a seed
+    # moves only with the bytes of its parts: a release that changes one for the same parts changes a public answer
+    # (README, "Stability").
     #
     #   SkiftetStatistical::Bandit::Draw.uniform("t")                       # => 0.8895498694938413
     #   SkiftetStatistical::Bandit::Draw.uniform_for("t", "explore")        # => 0.856909028643178
@@ -63,12 +66,16 @@ module SkiftetStatistical
           Checks.finite_answer([ (head(KeyParts.bytes(text)) >> 11) / UNIFORM_SCALE ], "the text").first
         end
 
-        # The uniform of the parts joined by NUL, in [0, 1).
+        # The uniform of the parts joined by NUL, in [0, 1): the seed's top 53 bits over 2**53, identical everywhere.
+        # Refuses, as an ArgumentError: a part holding a NUL byte, and a part whose to_s answers no String.
         def uniform_for(*parts)
           Checks.finite_answer([ (head(joined(parts)) >> 11) / UNIFORM_SCALE ], "the parts").first
         end
 
-        # The seed of the parts joined by NUL, an Integer in [0, 2**64), for Random.new.
+        # The seed of the parts joined by NUL, an Integer in [0, 2**64), for Random.new: identical in every process,
+        # on every machine and Ruby version, unlike String#hash, which Ruby seeds per process. nil reads as "", and a
+        # number by its to_s (7 and "7" are one part). Refuses, as an ArgumentError: a part holding a NUL byte, and a
+        # part whose to_s answers no String.
         def seed_for(*parts)
           Checks.finite_answer([ head(joined(parts)) ], "the parts").first
         end
@@ -79,7 +86,12 @@ module SkiftetStatistical
           Checks.finite_answer([ Checks.unit(uniform, "uniform").clamp(OPEN_LOW, OPEN_HIGH) ], "the uniform").first
         end
 
-        # The key a uniform draws from `weights`: `weighted`'s key.
+        # The key a uniform draws from `weights`: `weighted`'s key. Takes a Hash of key => weight (keys any objects,
+        # answered as given and never read) and a uniform in [0, 1]. A uniform drawn uniformly answers a key with
+        # probability its counted weight over the counted total; a key that counts 0 is never answered; no positive
+        # weight counts every key as 1; an empty Hash answers nil. Pure: the same weights and uniform answer the same
+        # key. Refuses, as an ArgumentError: weights that are not a Hash, a uniform outside [0, 1], a weight beyond the
+        # input domain, and counted weights whose sum is not finite.
         def from_weights(weights, uniform)
           weighted(weights, uniform).first
         end

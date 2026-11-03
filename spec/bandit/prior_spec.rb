@@ -85,6 +85,19 @@ RSpec.describe "SkiftetStatistical::Bandit::Prior" do
       based = prior.pooled(group: { views: 500, outcomes: 60 }, strength: 40.0, base: [ 3.0, 7.0 ])
       pair_close(based, [ 6.176470588235294, 43.8235294117647 ])
     end
+
+    it "LO1 refuses a negative strength, with or without a group or the item's own, before reading the tallies" do
+      message = "strength must be >= 0 (got -1.0)"
+      [ { group: nil }, { group: {} }, { group: { views: 40, outcomes: 10 } },
+        { group: { views: 40, outcomes: 10 }, own: { views: 5, outcomes: 1 } },
+        { group: "not a tally" } ].each do |tallies|
+        expect { prior.pooled(**tallies, strength: -1.0) }.to raise_error(ArgumentError, message), tallies.inspect
+        expect { prior.pooled(**tallies, strength: -1) }.to raise_error(ArgumentError, message), tallies.inspect
+      end
+      expect(prior.pooled(group: nil, strength: 0.0)).to eq([ 1.0, 1.0 ])
+      # At strength 0 the borrowed mean (1 + 10) / (2 + 40) is held at the base's 2 views.
+      pair_close(prior.pooled(group: { views: 40, outcomes: 10 }, strength: 0.0), [ 22.0 / 42.0, 62.0 / 42.0 ])
+    end
   end
 
   describe ".pooled_new, a new item's prior" do

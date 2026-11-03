@@ -101,6 +101,17 @@ RSpec.describe "SkiftetStatistical::Bandit::Draw" do
       expect(draw.from_weights({ "a" => -1.0, "b" => Float::NAN }, 0.7)).to eq("b")
     end
 
+    it "LO1 answers nil for an empty Hash, and refuses weights that are not a Hash or a uniform outside [0, 1]" do
+      expect(draw.from_weights({}, 0.5)).to be_nil
+      expect(draw.weighted({}, 0.5)).to eq([ nil, nil ])
+      expect { draw.from_weights([ [ "a", 1 ] ], 0.5) }.to raise_error(ArgumentError, /weights must be a Hash/)
+      [ -0.1, 1.1, Float::NAN, nil, "0.5" ].each do |uniform|
+        expect { draw.from_weights({ "a" => 1, "b" => 3 }, uniform) }.to raise_error(ArgumentError), uniform.inspect
+      end
+      expect(draw.from_weights({ "a" => 1, "b" => 3 }, 0.0)).to eq("a")
+      expect(draw.from_weights({ "a" => 1, "b" => 3 }, 1.0)).to eq("b")
+    end
+
     it "LO1 a uniform of 1.0 answers the last positive key" do
       expect(draw.from_weights({ "a" => 1.0, "b" => 2.0, "c" => 0.0 }, 1.0)).to eq("b")
       expect(draw.from_weights({ "a" => 0.1, "b" => 0.2, "c" => 0.3 }, 1.0)).to eq("c")

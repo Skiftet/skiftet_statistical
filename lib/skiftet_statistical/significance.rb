@@ -59,7 +59,9 @@ module SkiftetStatistical
     end
 
     # The z where the standard normal distribution function is p (the probit), by
-    # bisection on erfc. -Infinity at p = 0 and Infinity at p = 1.
+    # bisection on erfc. -Infinity at p = 0 and Infinity at p = 1. Its z maps back to p
+    # within 1e-12 relative, from p = 1e-300 to 1 - 1e-6 (erfc keeps the lower tail's
+    # precision). No randomness. Refuses, as an ArgumentError, a p outside [0, 1] or NaN.
     def normal_quantile(p)
       p = p.to_f
       raise ArgumentError, "p must be between 0 and 1, got #{p}" unless p.between?(0.0, 1.0)
@@ -77,6 +79,8 @@ module SkiftetStatistical
 
     # P(X >= statistic) for X ~ chi-squared(degrees_of_freedom): the regularized
     # upper incomplete gamma Q(dof / 2, statistic / 2). 1.0 for a statistic <= 0.
+    # Gamma's accuracy; refuses, as an ArgumentError, degrees of freedom that are
+    # not above 0 (a statistic above 0 only; at or below 0 nothing is read).
     def chi_squared_survival(statistic, degrees_of_freedom)
       return 1.0 if statistic <= 0.0
 
@@ -95,6 +99,13 @@ module SkiftetStatistical
     # nil (not tested) under minimum_total observations or with fewer than two arms
     # expected to get traffic; 0.0 when an arm expected to get nothing got some,
     # a mismatch no count explains.
+    #
+    # Takes: `observed`, a Hash of arm => count; `expected`, a Hash of arm => expected
+    # count (Symbol or String keys, as observed's); `minimum_total`, the smallest total
+    # tested, read as given above or below its default. Answers a Float in [0, 1], or
+    # nil. No randomness: the same counts answer the same p. Refuses nothing of its
+    # own: a Hash that is not one raises NoMethodError, and the p is
+    # chi_squared_survival's.
     def sample_ratio_p_value(observed:, expected:, minimum_total: SAMPLE_RATIO_MINIMUM_TOTAL)
       total = observed.values.sum
       return nil if total < minimum_total

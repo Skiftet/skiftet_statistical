@@ -17,6 +17,12 @@ module SkiftetStatistical
     class << self
       # Yields one Array per draw (one Float per arm, in order). Without a block, an Enumerator of the rows.
       # Returns nil.
+      #
+      # Takes: `posteriors`, a list of [alpha, beta] pairs (each above 0); `draws`, an Integer >= 0; `rng`, anything
+      # answering rand. Guarantees: the same pairs, draws and RNG stream give the same rows (the draw order above);
+      # every row holds one draw per arm from its Beta, the arms independent within a row. Refuses, as an
+      # ArgumentError: `draws` that is not an Integer >= 0 (before anything is drawn), and a parameter that is not
+      # above 0 at its first draw (Sampler's "shape must be > 0"; with 0 draws nothing is read).
       def each_draw(posteriors, draws:, rng:)
         draws = count(draws)
         return enum_for(:each_draw, posteriors, draws: draws, rng: rng) { draws } unless block_given?

@@ -67,7 +67,7 @@ module SkiftetStatistical
       private_constant :YES_NO, :AMOUNTS
 
       class << self
-        # Beta(1, 1), the frozen FLAT pair.
+        # Beta(1, 1), the frozen FLAT pair: the same frozen Array on every call.
         def flat = FLAT
 
         # A mean in [0, 1] (the bandit's one [0, 1] bound, Checks.unit) held at a strength >= 0: [strength * mean,
@@ -85,6 +85,11 @@ module SkiftetStatistical
 
         # THE leave-one-out rule: { views:, outcomes: }, the group less the item's own (own nil takes out nothing),
         # views at least 0 and outcomes within [0, views].
+        #
+        # Takes two yes/no tallies (nil reads as no evidence). Answers Floats. Guarantees: the one rule `pooled` and
+        # `pooled_new` borrow by, so a caller never nets an item out by hand; an own tally larger than its group
+        # borrows nothing rather than a negative count. Refuses, as an ArgumentError: a tally that is not a Hash or
+        # nil, a count below 0, a count that is not a number (a String included) or beyond the input domain.
         def borrowed(group:, own: nil)
           taken = left_out(tally(group, "group"), tally(own, "own"))
           answer = { views: taken[:views], outcomes: taken[:outcomes].clamp(0.0, taken[:views]) }
@@ -96,6 +101,12 @@ module SkiftetStatistical
         # min(strength, n). With nothing borrowed it is `base`; while n is at most the strength it is the group's
         # posterior from `base`; above it the borrowed mean stays and its weight stops growing, so a large group never
         # outweighs the item's own evidence for long.
+        #
+        # Takes: `group` and `own` yes/no tallies (as `borrowed`), `strength` a number >= 0 (views), `base` a pair
+        # above 0. Answers [alpha, beta], plain arithmetic, the mean formed exactly and rounded once, so the same
+        # inputs answer the same pair bit for bit everywhere. Refuses, as an ArgumentError: a `base` that is not a pair
+        # above 0, then a `strength` below 0 or not a number ("strength must be >= 0 (got -1.0)"), whatever the tallies
+        # hold, a nil group included; then whatever `borrowed` refuses.
         def pooled(group:, own: nil, strength:, base: FLAT)
           base_alpha, base_beta = pair(base, "base")
           strength = Checks.nonnegative(strength, "strength")
@@ -113,6 +124,10 @@ module SkiftetStatistical
         # evidence (`group` less `own`; a nil group adds nothing), added by the bandit's one yes/no rule. With no
         # others and no group it is Beta(1, 1) at the default weight of 2. `others` is a list, read by the bandit's one
         # list reader (Tallies.list), each a Hash of group: and own:.
+        #
+        # Answers [alpha, beta], plain arithmetic, the pooled rate formed exactly and rounded once. Refuses, as an
+        # ArgumentError: a `weight` below 0 or not a number, `others` that is not a list of Hashes, and whatever
+        # `borrowed` refuses of any tally.
         def pooled_new(others:, group: nil, own: nil, weight: 2.0)
           weight = Checks.nonnegative(weight, "weight")
           others = Tallies.list(others, "others", "Hashes of group: and own:")

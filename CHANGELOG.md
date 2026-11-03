@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+Documentation and examples only: no code path changes and no answer moves, for
+any input, key or seed (a patch, by the README's new Stability section).
+
+- README: a Stability section (a change that moves a seeded answer for the same
+  inputs is a major or minor version, as its entry here states, never a patch)
+  and an Interface contract section: for each method an application calls,
+  what it takes, what it answers, what it guarantees (determinism, which inputs
+  move which outputs, accuracy) and what it refuses. The same contract is in
+  each method's doc comment.
+- `spec/interface_contract_spec.rb` indexes, method by method, the examples
+  that back each stated guarantee, and fails when a cited example is gone, a
+  listed method is no longer public, or the README's list differs.
+- New examples: `BetaFunction.regularized` and `.quantile` at parameters from
+  1 000 to 50 000 against an exact binomial reference, with the symmetry
+  identity, I_(1/2)(a, a) = 1/2, the quantile's inversion and the 2.5 % and
+  97.5 % quantiles at the skew-corrected normal approximation (accuracy now
+  stated: 4 n ln n machine epsilons, relative, n = alpha + beta);
+  `Posteriors#rank`: an added item absent from `may_lead` changes neither the
+  others' order, the leader nor the branch over 1 000 keys with `explore` and
+  `min_views` set, and a `min_views` below 0 reads as none; `Prior.pooled`
+  refuses a negative strength with or without a group; a posterior set is a
+  value no reader writes to; `summary` is exact and per item;
+  `Draw.from_weights`' refusals; `WeightedPosterior`'s reading of its counts by
+  `Integer()`; `JointBeta`'s refusal of a parameter not above 0;
+  `sample_ratio_p_value`'s `minimum_total` above its default.
+
 ## [0.4.0] - unreleased
 
 The generic bandit: one posterior set of items, ordered and picked by one rule

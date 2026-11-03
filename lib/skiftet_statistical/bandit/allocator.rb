@@ -107,6 +107,11 @@ module SkiftetStatistical
       class FixedAllocation < ArgumentError; end
 
       # The allocator's settings, each a finite number. The defaults are the values its A/B tests run with.
+      #
+      # Takes any of the DEFAULTS' names by keyword. Answers a frozen value (`to_h`, `==` and `hash` by its settings).
+      # Guarantees: every setting is read by the decision it names, at every call that is handed this Config (the
+      # allocator never reads a setting from anywhere else); a setting left out is its DEFAULTS value. Refuses, as an
+      # ArgumentError: a name that is not a setting, a value that is not a finite number, a floor outside (0, 1].
       class Config
         DEFAULTS = {
           warmup_exposures: 300, floor: 0.10, max_step: 0.15, win_p_best: 0.95, win_loss: 0.0025, won_share: 0.95,
@@ -344,6 +349,11 @@ module SkiftetStatistical
 
       # The won split: the winner `won_share`, the other arms `won_rest` shared equally; a single arm gets
       # everything. The keys are `arms` as given (Symbols or Strings).
+      #
+      # Takes a list of arms, the winner (compared with ==, so give it as the arms are given) and a Config, whose
+      # won_share and won_rest are the ones read. Pure arithmetic: the same arms and Config answer the same split.
+      # Refuses nothing of its own: a winner that is not one of the arms is not checked (every arm then gets its
+      # won_rest share), and a config that is not a Config raises NoMethodError at its first setting.
       def self.won_weights(arms, winner, config: Config.new)
         return { winner => 1.0 } if arms.size == 1
 
@@ -372,6 +382,19 @@ module SkiftetStatistical
         Shares.new(arms, fixed_shares: nil, arm_floors: nil, config: config).lift(target)
       end
 
+      # The decision for one pass (the class comment's rule): { weights:, phase:, stats:, winner:, result_changed:,
+      # leader: }, arms as Symbols.
+      #
+      # Takes: `arms` (1 to Config#max_arms, Symbols or Strings), `tallies` ({ arm => { exposures:, conversions: } },
+      # optionally the weighted sums and guardrails), `status` ("running", "paused" or "won"), `winner_arm`, `rng`
+      # (answering rand), `draws` (a whole number of joint draws, at least 1), `previous_weights`, `hold_satisfied`,
+      # `config` (a Config, whose every setting is read), `fixed_shares` and `arm_floors`.
+      # Guarantees: pure, no clock and no state; the same inputs and the same RNG stream answer the same result, the
+      # joint draws taken arm by arm in the given order (JointBeta), so the stream's use is fixed by the arms and
+      # `draws`; the inputs are not changed; `hold_satisfied` moves only the crown (the weights, the phase and the
+      # winner), never `stats`. Refuses, as an ArgumentError before any draw: a config that is not a Config, no arms or
+      # more than Config#max_arms, `draws` below 1 once read by Integer() (whose own error a value it cannot read
+      # raises), the per-arm share checks, and `allocation: :fixed` (FixedAllocation, an ArgumentError).
       def self.call(arms:, tallies:, status:, winner_arm:, rng:, previous_weights: nil, draws:, hold_satisfied: true,
                     allocation: :adaptive, config: Config.new, fixed_shares: nil, arm_floors: nil)
         new(arms: arms, tallies: tallies, status: status, winner_arm: winner_arm, rng: rng,

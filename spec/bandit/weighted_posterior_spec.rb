@@ -17,6 +17,18 @@ RSpec.describe SkiftetStatistical::Bandit::WeightedPosterior do
       expect(described_class.count(exposures: 300, conversions: 27)).to include(exposures: 300, conversions: 27)
     end
 
+    # 0.2.0's reading, kept as it was: the counts by Kernel#Integer, the weighted sums by to_f.
+    it "reads the counts by Kernel#Integer, so a Float truncates, and what Integer() cannot read raises its own error" do
+      expect(described_class.count(exposures: 300.9, conversions: 27.2)).to include(exposures: 300, conversions: 27)
+      expect(described_class.count(exposures: nil, conversions: nil)).to include(exposures: 0, conversions: 0)
+      expect(described_class.count(tally(10, 2, weighted_exposures: "20", weighted_conversions: "3")))
+        .to include(weighted_exposures: 20.0, weighted_conversions: 3.0)
+      expect { described_class.count(exposures: "many") }.to raise_error(ArgumentError)
+      expect { described_class.count(exposures: [ 1 ]) }.to raise_error(TypeError)
+      expect { described_class.count(exposures: Float::NAN) }.to raise_error(FloatDomainError)
+      expect { described_class.count(exposures: Float::INFINITY) }.to raise_error(FloatDomainError)
+    end
+
     it "keeps the weighted sums only when both are given and the weighted exposures are above zero" do
       weighted = described_class.count(tally(800, 80, weighted_exposures: 1_600, weighted_conversions: 150))
       zero = described_class.count(tally(800, 96, weighted_exposures: 0.0, weighted_conversions: 0.0))
@@ -80,6 +92,10 @@ RSpec.describe SkiftetStatistical::Bandit::WeightedPosterior do
       count = described_class.count(tally(400, 40))
 
       expect(described_class.beta(count, prior_alpha: 0.5, prior_beta: 2.0)).to eq([ 40.5, 362.0 ])
+    end
+
+    it "refuses a negative exposure count, as an ArgumentError" do
+      expect { described_class.beta(described_class.count(tally(-5, 3))) }.to raise_error(ArgumentError)
     end
   end
 

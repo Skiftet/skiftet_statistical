@@ -12,6 +12,16 @@ module SkiftetStatistical
   #
   # The arithmetic and its order are part of the contract: with parameters in the hundreds or more the lgamma
   # terms of the front factor reach 1e3-1e5, so a reordered sum can move the result by 1e-12 to 1e-10.
+  #
+  # Accuracy (spec/beta_function_spec.rb): for parameters up to a few hundred, `regularized` is within 5e-12
+  # relative of an exact reference (measured worst 2.4e-13). For parameters from 1 000 to 50 000 each, with n = alpha
+  # + beta, the front factor's lgamma terms reach about n log n, whose roundings bound the answer to 4 n log n machine
+  # epsilons, relative (about 1e-9 at n = 100 000; measured worst 0.9 of it against an exact binomial reference), and
+  # the identities I_x(a, b) + I_(1-x)(b, a) = 1 and I_(1/2)(a, a) = 1/2 hold within that bound. `quantile` bisects to
+  # a Float's spacing, so regularized(quantile(p)) is p within the same bound, and its 2.5 % and 97.5 % quantiles lie
+  # within 0.001 sd of the normal approximation with its first skewness term. Past a total of about 3 * 10**8 the
+  # continued fraction's fixed bound binds (Bandit::Posteriors#summary states what that does to an interval). The same
+  # inputs answer the same Float on one platform; another math library's lgamma can move the last bits.
   module BetaFunction
     # Lentz's floor for a denominator that would otherwise be zero.
     TINY = 1.0e-30
@@ -25,13 +35,16 @@ module SkiftetStatistical
     QUANTILE_STEPS = 80
 
     class << self
-      # I_x(alpha, beta) for alpha, beta > 0: 0.0 for x <= 0, 1.0 for x >= 1.
+      # I_x(alpha, beta) for alpha, beta > 0: 0.0 for x <= 0, 1.0 for x >= 1. Refuses, as an ArgumentError: an
+      # alpha or beta whose to_f is not a finite number above 0, and an x whose to_f is NaN.
       def regularized(x, alpha, beta)
         x = number(x, "x")
         incomplete(x, *parameters(alpha, beta))
       end
 
-      # The x where I_x(alpha, beta) = probability, by bisection: 0.0 for probability <= 0, 1.0 for >= 1.
+      # The x where I_x(alpha, beta) = probability, by bisection: 0.0 for probability <= 0, 1.0 for >= 1. Refuses, as
+      # an ArgumentError: an alpha or beta whose to_f is not a finite number above 0, and a probability whose to_f is
+      # NaN.
       def quantile(probability, alpha, beta)
         probability = number(probability, "probability")
         alpha, beta = parameters(alpha, beta)

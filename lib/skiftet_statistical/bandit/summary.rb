@@ -73,6 +73,17 @@ module SkiftetStatistical
 
       # { item => { views:, mean:, lower:, upper:, p_best:, expected_loss: } }, every item in item order; p_best and
       # expected_loss nil for an item `among` does not name (see above).
+      #
+      # Takes: `credible_mass` a number above 0 and below 1; `among` nil (every item), [] (none: means and intervals
+      # only, for a set of any size) or a list of at most EXACT_PICK_MAX item names. Guarantees:
+      # - Exact, never drawn: no key, uniform or RNG is read, so the same set answers the same summary bit for bit on
+      #   every call, whatever the process's random state.
+      # - An item's views, mean and interval are its own pair's alone (the pair as given), so the item answers them
+      #   alike in any set that holds it, a set of its own included; P(best) and the loss read the items `among` names
+      #   and no other.
+      # - The interval's ends are BetaFunction.quantile's (that function's stated accuracy), or the Normal's mean -+ z
+      #   sd; P(best) is BetaArgmax.probabilities' (or NormalArgmax's) quadrature, and the loss is never below 0.
+      # Refuses the list above, each an ArgumentError before anything is computed.
       def summary(credible_mass: 0.95, among: nil)
         tail = summary_tail(credible_mass)
         named = summary_named(among)

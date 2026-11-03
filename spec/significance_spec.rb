@@ -139,6 +139,14 @@ RSpec.describe SkiftetStatistical::Significance do
       expect(described_class.sample_ratio_p_value(**fixture, minimum_total: 199)).to be_a(Float)
     end
 
+    it "reads minimum_total as given above the default too: the total must reach it" do
+      lopsided = { observed: { control: 600, a: 399 }, expected: { control: 499.5, a: 499.5 } }
+      expect(described_class.sample_ratio_p_value(**lopsided)).to be < 1e-9
+      expect(described_class.sample_ratio_p_value(**lopsided, minimum_total: 1_000)).to be_nil
+      expect(described_class.sample_ratio_p_value(**lopsided, minimum_total: 999))
+        .to eq(described_class.sample_ratio_p_value(**lopsided))
+    end
+
     it "is 0 when an arm expected to get nothing got some, whether it is expected 0 or not listed" do
       expect(described_class.sample_ratio_p_value(observed: { control: 150, a: 50 },
                                                   expected: { control: 200.0, a: 0.0 })).to eq(0.0)

@@ -157,8 +157,26 @@ module SkiftetStatistical
       # LARGEST_TOTAL scaled to it; views: { item => Float }. All frozen.
       attr_reader :items, :kind, :parameters, :views
 
+      # THE CONTRACT OF A SET, whichever builder made it (README, "Interface contract"; each guarantee's examples are
+      # indexed in spec/interface_contract_spec.rb):
+      # - A set is a value: `items`, `kind`, `parameters` and `views` are frozen, and no reader (`rank`, `pick`,
+      #   `Order#repin`, `summary`, `means`, `values`, `greedy`) writes to the set, so one set may be built once and read
+      #   from many requests and threads. (The order and position odds keep a memo on a set its caller has not frozen;
+      #   a frozen set computes them each time.)
+      # - An item's pair is its own tally's and prior's (or its own given pair) alone: no other item moves it.
+      # - The pairs are plain arithmetic, formed as stated and rounded once where the class comment says so, so the same
+      #   inputs build the same pairs bit for bit in every process, on every machine and Ruby version.
       class << self
         # Beta posteriors from yes/no tallies, { item => tally }, under `priors` (nil, one pair, or { item => pair }).
+        #
+        # Takes: `items`, a Hash of item name (a non-blank String, in the tie order) => tally ({ views:, outcomes: },
+        # Symbol or String keys, numbers >= 0 and at most Numbers::LARGEST, fractional allowed, optionally the weighted
+        # sums); `priors` nil (Beta(1, 1)), one pair [alpha, beta] (each >= 0) or { item => pair } naming every item.
+        # Answers: a :beta set whose `parameters` are { item => [alpha + c, beta + n - c] }, c the outcomes clamped to
+        # [0, views] (or the weighted outcomes rescaled to the Kish size), a pair above LARGEST_TOTAL scaled to it.
+        # Refuses, as an ArgumentError when the set is built: what the class comment lists (a name that is not a
+        # usable String, a count below 0 or not a number, a Hash of priors naming a name that is not an item or leaving
+        # one out, a pair that is not above 0 once the tally is added).
         def yes_no(items, priors: nil)
           entries = named_entries(items, "items")
           prior_of = prior_per_item(nil.equal?(priors) ? Prior.flat : priors, entries, "priors") do |given, label|
@@ -183,6 +201,11 @@ module SkiftetStatistical
 
         # Normal posteriors for the mean per view from amount tallies, { item => tally }, under `priors` (one
         # Prior::Amount, or { item => Prior::Amount }).
+        #
+        # Takes: tallies { views:, outcomes:, outcome_squares: } (views and outcome_squares >= 0, outcomes the sum of
+        # amounts, any sign), optionally the weighted sums. Answers: a :normal set whose `parameters` are { item =>
+        # [mean, standard deviation] } of the mean per view. Refuses, as an ArgumentError: as `yes_no` does, and a prior
+        # that is not a Prior::Amount (there is no flat amounts prior, so nil and a pair are refused).
         def amounts(items, priors:)
           entries = named_entries(items, "items")
           prior_of = prior_per_item(priors, entries, "priors") { |given, label| Tallies.amount_prior(given, label) }
@@ -206,6 +229,12 @@ module SkiftetStatistical
         end
 
         # Beta posteriors given as pairs, { item => [alpha, beta] }, with views { item => Float } when given.
+        #
+        # Takes: `pairs`, a Hash of item name => [alpha, beta], each a finite number above 0 within the input domain;
+        # `views` nil (every item 0) or a Hash of item name => views >= 0 (an item it leaves out reads 0). Answers: a
+        # :beta set holding the pairs as given (`summary` reads them so), scaled in `parameters` only above
+        # LARGEST_TOTAL. Refuses, as an ArgumentError: the names `yes_no` refuses, a parameter that is not a number
+        # above 0, and views that name a name that is not an item or are below 0.
         def beta(pairs, views: nil)
           from_pairs(:beta, pairs, views)
         end

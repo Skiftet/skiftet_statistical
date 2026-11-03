@@ -25,6 +25,15 @@ module SkiftetStatistical
     # A blank leading arm (nil, false, an empty or whitespace-only String, an empty Symbol) reads as none; any other
     # arm is kept as a String. This is ActiveSupport's `blank?`, in every encoding: a String that is not
     # ASCII-compatible (UTF-16, UTF-32) is matched with the pattern in its own encoding.
+    #
+    # Takes: `leading_arm` (any arm, or a blank one), `leading_since`, `now` and `last_pass_at` (Times, numbers of
+    # seconds, or any values whose difference compares with a number of seconds; leading_since and last_pass_at may be
+    # nil), `hold_seconds` and `max_gap_seconds` (numbers of seconds, or any values a difference compares with).
+    # Guarantees: pure, no clock of its own and no state; the two lengths given are the two read (the defaults,
+    # HOLD_SECONDS and MAX_GAP_SECONDS, only when they are left out); both bounds are inclusive: satisfied from exactly
+    # hold_seconds after leading_since, and a gap of exactly max_gap_seconds still unbroken. Refuses nothing of its
+    # own: leaving out a required keyword is Ruby's ArgumentError, and a clock value that cannot be subtracted raises
+    # its own error (NoMethodError or TypeError) when the hold is first asked.
     class WinHold
       HOLD_SECONDS = 86_400
       MAX_GAP_SECONDS = 1_200

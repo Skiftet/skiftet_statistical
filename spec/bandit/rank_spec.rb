@@ -223,6 +223,20 @@ RSpec.describe "SkiftetStatistical::Bandit::Posteriors#rank" do
         .to eq(items: %w[b d a c], leader: nil, branch: :shuffled)
     end
 
+    it "LO2 reads a min_views below 0 as none, as 0 reads it: every contender may be explored and every head leads" do
+      # d has no views at all, so at 0 and below it is eligible and leads, and above 0 it is not.
+      [ 0.1, 0.3, 0.7 ].each do |value|
+        none = four.rank(uniforms: chosen(value), **split, may_lead: %w[d], min_views: 0.0)
+
+        expect(four.rank(uniforms: chosen(value), **split, may_lead: %w[d], min_views: -1.0)).to eq(none), value.to_s
+        expect(four.rank(uniforms: chosen(value), **split, may_lead: %w[d], min_views: -1e100)).to eq(none), value.to_s
+        expect(none.leader).to eq("d"), value.to_s
+      end
+      expect(four.rank(uniforms: chosen(0.3), **split, may_lead: %w[d], min_views: 0.0).branch).to eq(:explored)
+      expect(answer(four.rank(uniforms: chosen(0.3), **split, may_lead: %w[d], min_views: 1e-9)))
+        .to eq(items: %w[d c a b], leader: nil, branch: :thompson)
+    end
+
     it "LO2 compares the branch value strictly: at shuffle it explores, at shuffle + explore it takes Thompson" do
       expect(four.rank(uniforms: chosen(0.25), **split).branch).to eq(:explored)
       expect(four.rank(uniforms: chosen(0.5), **split).branch).to eq(:thompson)
@@ -395,6 +409,47 @@ RSpec.describe "SkiftetStatistical::Bandit::Posteriors#rank" do
       expect(moved).to be_empty, "orders moved: #{moved.first(3).inspect}"
       # By hand: 85 of these keys have an explore uniform below 0.1.
       expect(branches).to eq(shuffled: 85, thompson: 915)
+    end
+
+    # The rule's contenders are the free items may_lead names, so an item it does not name takes no part in choosing
+    # the head or the branch, and the rest follow by their own keyed draws (or priorities), which no other item moves.
+    # Here the added item has the most views and the best posterior, so it would lead most keys were it named.
+    it "LO2 an added item absent from may_lead never changes the others' order, the leader or the branch over " \
+       "1 000 keys, with explore and min_views set" do
+      views = { "a" => 50.0, "b" => 10.0, "c" => 50.0, "d" => 5.0, "e" => 50.0, "f" => 30.0 }
+      normal_pairs = { "a" => [ 4.0, 1.0 ], "b" => [ 4.5, 1.5 ], "c" => [ 3.5, 0.8 ], "d" => [ 5.0, 2.5 ],
+                       "e" => [ 4.2, 0.6 ], "f" => [ 3.9, 1.1 ] }
+      sets = [
+        [ posteriors.beta(six_pairs, views: views), posteriors.beta(six_pairs.merge("g" => [ 40.0, 10.0 ]),
+                                                                    views: views.merge("g" => 500.0)) ],
+        [ posteriors.normal(normal_pairs, views: views), posteriors.normal(normal_pairs.merge("g" => [ 9.0, 0.5 ]),
+                                                                          views: views.merge("g" => 500.0)) ]
+      ]
+      rules = [ { explore: 0.2, may_lead: %w[a b c d e], min_views: 20.0 },
+                { shuffle: 0.1, explore: 0.2, may_lead: %w[a b d], min_views: 20.0 } ]
+      branches = Hash.new(0)
+      second = 0
+      moved = []
+
+      keys.each do |key|
+        sets.each do |small, large|
+          rules.each do |rule|
+            old = small.rank(key: key, **rule)
+            new = large.rank(key: key, **rule)
+            branches[old.branch] += 1
+            second += 1 if new.items[1] == "g"
+            next if new.items - [ "g" ] == old.items && new.leader == old.leader && new.branch == old.branch
+
+            moved << [ key, rule, answer(old), answer(new) ]
+          end
+        end
+      end
+
+      expect(moved).to be_empty, "orders moved: #{moved.first(3).inspect}"
+      # Every branch ran, and the added item was often the first item after the head, where it would have led.
+      expect(branches.keys).to contain_exactly(:shuffled, :explored, :thompson)
+      expect(branches.values).to all(be > 100)
+      expect(second).to be > 1_000
     end
 
     it "LO2 gives the same orders in a fresh process" do

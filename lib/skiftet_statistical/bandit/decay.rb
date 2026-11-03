@@ -34,6 +34,9 @@ module SkiftetStatistical
     # below 0, a sum of amounts (the tally reader's one list of sums that may be, Tallies::SIGNED_SUMS). Anything else
     # is an ArgumentError, in a row past the cap too, and every answer passes the bandit's one check of an answer
     # (Checks.finite_answer).
+    #
+    # Guarantees: no randomness and no clock (the caller gives every age), so the same rows answer the same sums;
+    # a weight is 1.0 at age 0, 0.5 at one half-life, and 0.0 past the cap.
     module Decay
       # The sums `fold` answers, each weighted.
       SUMS = %i[views outcomes outcome_squares].freeze

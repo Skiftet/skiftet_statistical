@@ -14,6 +14,13 @@ module SkiftetStatistical
   #
   # The arithmetic and its order are part of the contract: an app that pins outputs at 1e-12 compares them with
   # this exact sequence of operations, so a reordered formula is a breaking change even when it is "the same".
+  #
+  # Accuracy (spec/gamma_spec.rb): within 5e-12 relative of the exact Poisson sums for whole a up to 200 on both sides
+  # of x = a + 1 (measured worst 2e-13), P + Q = 1, and the closed forms at a = 1/2 and a = 1. No randomness: the
+  # same inputs answer the same Float on one platform; another math library's lgamma or exp can move the last bits.
+  # Refuses, as an ArgumentError: an a whose to_f is not a finite number above 0, and an x whose to_f is NaN (both
+  # read by to_f: a numeric String reads as its number, a non-numeric one as 0.0, and an object without to_f raises
+  # NoMethodError).
   module Gamma
     # A series term or a fraction step this small next to the total is the last one taken.
     EPSILON = 1e-15

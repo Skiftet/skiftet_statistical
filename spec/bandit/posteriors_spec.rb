@@ -485,6 +485,45 @@ RSpec.describe "SkiftetStatistical::Bandit::Posteriors" do
     end
   end
 
+  describe "a set is a value" do
+    # A caller may build a set once and read it from many requests and threads: every reader answers from frozen data
+    # and writes nothing to the set, so the readers after any number of calls answer what they answered before.
+    it "LO1 is frozen data that no reader changes: items, kind, parameters and views, after every operation" do
+      sets = [
+        posteriors.yes_no({ "a" => { views: 40, outcomes: 8 }, "b" => { views: 10, outcomes: 1 },
+                            "c" => { views: 25, outcomes: 4 } }, priors: [ 2.0, 3.0 ]),
+        posteriors.beta({ "a" => [ 3.0e6, 7.0e6 ], "b" => [ 2.0, 8.0 ] }, views: { "a" => 50.0 }),
+        posteriors.amounts({ "a" => { views: 30, outcomes: 90.0, outcome_squares: 400.0 },
+                             "b" => { views: 20, outcomes: 50.0, outcome_squares: 300.0 } }, priors: amount_prior)
+      ]
+      sets.each do |set|
+        before = Marshal.dump([ set.items, set.kind, set.parameters, set.views ])
+
+        expect([ set.items, set.parameters, set.views ]).to all(be_frozen)
+        expect(set.items).to all(be_frozen)
+        expect(set.parameters.values).to all(be_frozen)
+        order = set.rank(key: [ "value", "k1" ], explore: 0.3, may_lead: [ set.items.first ], min_views: 5.0)
+        order.repin({ 0 => set.items.last })
+        set.rank(rng: Random.new(3), shuffle: 0.2, pinned: { 0 => set.items.last })
+        set.pick(key: "k2", explore: 0.5)
+        summary = set.summary
+        set.summary(credible_mass: 0.8, among: [])
+        set.means
+        set.values(rng: Random.new(4))
+        set.greedy
+
+        expect(Marshal.dump([ set.items, set.kind, set.parameters, set.views ])).to eq(before), set.kind.to_s
+        expect(set.rank(key: [ "value", "k1" ], explore: 0.3, may_lead: [ set.items.first ], min_views: 5.0))
+          .to eq(order)
+        # A set its caller freezes answers alike.
+        set.freeze
+        expect(set.rank(key: [ "value", "k1" ], explore: 0.3, may_lead: [ set.items.first ], min_views: 5.0))
+          .to eq(order)
+        expect(set.summary).to eq(summary)
+      end
+    end
+  end
+
   describe "the composed priors" do
     it "LO1 a gated row's priors: pooled for the measured items, pooled_new for a new one, then the row's own evidence" do
       groups = { "x" => { views: 900, outcomes: 90 }, "y" => { views: 15, outcomes: 3 }, "z" => { views: 8, outcomes: 2 } }
