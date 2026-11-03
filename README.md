@@ -1,8 +1,8 @@
 # skiftet_statistical
 
-Skiftet's shared, dependency-free **statistics toolkit** — the workspace home for
-reusable statistical analysis code, so the same z-test, percentile, or sampler
-isn't re-implemented (differently) in every app.
+A dependency-free **statistics toolkit** for Ruby: reusable statistical analysis
+code, so the same z-test, percentile, sampler or bandit isn't re-implemented
+(differently) in every app.
 
 Modules:
 
@@ -17,11 +17,20 @@ Modules:
   expected loss).
 - **`Bandit`** (+ `Policies`) — multi-armed bandit (Thompson Sampling,
   epsilon-greedy, UCB1, Softmax) for online explore/exploit decisions.
+- **`Bandit::Posteriors`** (with **`Bandit::Prior`**, **`Bandit::Decay`**,
+  **`Bandit::Draw`**, **`Bandit::NormalArgmax`** and **`Bandit::Pass`**) — new
+  in 0.4.0, the generic bandit: a set of items with their views and yes/no or
+  amount posteriors, ordered and picked by one rule from a key, given uniforms
+  or an RNG, with the odds of what it draws (exact for a pick among up to
+  `EXACT_PICK_MAX` (20) contenders and for orders and positions over up to
+  `EXACT_ORDER_MAX` (10) free items with none barred from leading, otherwise a
+  seeded Monte Carlo estimate with its standard error) and the summaries an
+  allocation reads.
 - **`Bandit::Allocator`**, **`Bandit::WinHold`**, **`Bandit::WeightedPosterior`**
   — an A/B test's traffic allocation: Thompson sampling with a floor per arm, a
-  step limit, an automatic win and a hold on it (f1's rule).
-  Since 0.3 also per-arm floors and fixed shares, and one phase rule for any
-  posterior (`Allocator.from_summary`).
+  step limit, an automatic win and a hold on it.
+  Also per-arm floors and fixed shares, and one phase rule for any posterior
+  (`Allocator.from_summary`).
 - **`LinearValue`** (with **`Cholesky`**) — P(best), expected loss and
   intervals of a linear value of several rates when both the rates (one joint
   normal) and their weights are uncertain.
@@ -37,7 +46,8 @@ Modules:
   cell is allocated on.
 - **`BetaArgmax`** (with **`GaussLegendre`** and `BetaFunction.log_density`) —
   the exact probability that each of several Betas is the largest, the seedless
-  pick it describes, and the greedy pick.
+  pick it describes, and the greedy pick; since 0.4.0 also a draw's position,
+  the distribution function and E[the largest].
 - **`Prequential`** — the prequential log score, and the bits per event a
   deeper predictor saves, with cluster-robust intervals.
 - **`Cusum`** — a one-sided change test: its statistic, its run length, the
@@ -48,7 +58,7 @@ Modules:
 In a Gemfile (published on rubygems.org):
 
 ```ruby
-gem "skiftet_statistical", "~> 0.3.0"
+gem "skiftet_statistical", "~> 0.4.0"
 ```
 
 Or build/install locally:
@@ -127,7 +137,7 @@ B.quantile(0.975, 41.0, 361.0)            # its inverse: an exact 95 % credible 
 ```
 
 The arithmetic and its order are part of the API: an app that pins these
-outputs (f1 does, at 1e-12) compares them with this exact sequence of
+outputs (at 1e-12, say) compares them with this exact sequence of
 operations, so a reordered formula is a breaking change even when it is "the
 same" formula.
 
@@ -161,20 +171,24 @@ caller gets the same rows only while this order holds.
 require "skiftet_statistical"
 
 bandit = SkiftetStatistical.bandit(
-  arms: %w[facebook whatsapp bluesky x email],
+  arms: %w[a b c d e],
   policy: SkiftetStatistical::Policies::ThompsonSampling.new,
 )
 
-choice = bandit.select          # which channel to promote right now, e.g. "whatsapp"
+choice = bandit.select          # which option to show right now, e.g. "b"
 # ... show that option to the user ...
 bandit.record(choice, 1)        # reward: 1 = it converted, 0 = it didn't
 
 bandit.best_arm                 # current best by empirical mean
-bandit.stats                    # { "whatsapp" => { pulls:, mean:, reward_sum: }, ... }
+bandit.stats                    # { "b" => { pulls:, mean:, reward_sum: }, ... }
 ```
 
-Rewards are expected in **[0.0, 1.0]** — a binary `0`/`1` (e.g. "did this share
-lead to a signup?") is the common case, but any value in that range works.
+Rewards are expected in **[0.0, 1.0]** — a binary `0`/`1` (e.g. "did this view
+lead to an outcome?") is the common case, but any value in that range works.
+
+To order several items, or to pick one by a sticky key with the odds of the
+pick (exact up to `EXACT_PICK_MAX` contenders), use the posterior set
+(`Bandit::Posteriors`, below).
 
 ## Policies
 
@@ -196,6 +210,12 @@ SkiftetStatistical::Policies::Softmax.new(temperature: 0.1)
 no tuning, and explores exactly as much as the evidence warrants. Cold start (no
 data) is `Beta(1,1)` on every arm, i.e. uniform random, so early plays are pure
 exploration.
+
+The four policies are kept as 0.3.0 wrote them: in 0.4.0, `ThompsonSampling`
+and `Softmax` included, each answers as in 0.3.0 for every input, the same arm
+and the same use of the rng. New callers draw through `Bandit::Posteriors`
+instead, the posterior set, which holds one set of items and ranks, picks and
+computes odds and summaries on it.
 
 ## Persistence
 
@@ -224,29 +244,460 @@ Every stochastic policy (and the sampler) takes an `rng:`. Inject a seeded
 policy = SkiftetStatistical::Policies::ThompsonSampling.new(rng: Random.new(42))
 ```
 
-## Example: f1 share-channel bandit
+## The generic bandit (`Bandit::Posteriors`)
 
-The motivating use case — make the petition ShareStep's **primary** button the
-channel that drives the most signups, while continuously testing the others:
+New in 0.4.0. One set of items, each with its posterior and its views, and every
+operation a bandit needs on it, each written once: the order rule (`rank`, with
+`pick` its head), the odds of what that rule draws, per-item summaries for an
+allocation, and plain draws. The caller decides what counts as a view (an item
+was seen) and what counts as an outcome; an outcome is yes/no (a Beta posterior
+an item) or an amount (a Normal posterior for the mean per view). Every random
+input is injected: a key, given uniforms or an RNG.
 
 ```ruby
-# Nightly (or per request) build a bandit from observed share -> signup data.
-bandit = SkiftetStatistical::Bandit.from_h(
-  Rails.cache.read("share_bandit_state") || { arms: SHARE_CHANNELS.map { { name: _1 } } },
-  policy: SkiftetStatistical::Policies::ThompsonSampling.new,
-)
-primary = bandit.select            # the channel to feature as the primary CTA
+P = SkiftetStatistical::Bandit::Posteriors
 
-# When a share converts:
-bandit.record(channel, 1)
-Rails.cache.write("share_bandit_state", bandit.to_h)
+set = P.yes_no({ "a" => { views: 40, outcomes: 8 },
+                 "b" => { views: 10, outcomes: 1 },
+                 "c" => { views: 25, outcomes: 4 } })
+set.items       # => ["a", "b", "c"]
+set.kind        # => :beta
+set.parameters  # => { "a" => [9.0, 33.0], "b" => [2.0, 10.0], "c" => [5.0, 22.0] }  (Beta(1, 1) prior)
+set.views       # => { "a" => 40.0, "b" => 10.0, "c" => 25.0 }
+set.greedy      # => "a", the largest posterior mean
+
+order = set.rank(key: %w[list visit-1], shuffle: 0.1)
+order.items     # => ["a", "c", "b"], the same for this key in every process
+order.leader    # => "a"
+order.branch    # => :thompson (:shuffled for about 10 % of keys)
+order.draws     # => { "a" => 0.2907..., "b" => 0.1004..., "c" => 0.1386... }
+
+set.pick(rng: Random.new(1)).item     # => "c", the head of one Thompson draw
+set.values(rng: Random.new(1))        # => [0.1721..., 0.0861..., 0.3054...], one draw an item
+```
+
+### Building a set
+
+- `yes_no(items, priors: nil)`: `{ item => tally }`, a tally
+  `{ views:, outcomes: }` (Symbol or String keys, numbers >= 0, fractional
+  allowed, the outcomes clamped to the views), optionally with
+  inverse-propensity sums `weighted_views` (the sum of 1 / p),
+  `weighted_outcomes` (of y / p) and `weighted_views_squared` (of 1 / p^2):
+  the weighted outcomes are then rescaled to the Kish size, never above the
+  views, so an item that was shown more while it led is not overrated. Priors:
+  nil (Beta(1, 1)), one pair `[alpha, beta]` for every item, or
+  `{ item => pair }`.
+- `amounts(items, priors:)`: a tally `{ views:, outcomes:, outcome_squares: }`
+  (the outcomes the sum of amounts, any sign; optionally the weighted sums and
+  `weighted_outcome_squares`) under one `Prior::Amount` or
+  `{ item => Prior::Amount }`; there is no flat amounts prior, as an amount has
+  a scale. With k prior views at mean mu0 and per-view variance v0, and n views
+  of mean m and variance s^2, the mean per view is Normal with mean
+  (k mu0 + n m) / (k + n) and variance
+  [k v0 + n s^2 + k n (m - mu0)^2 / (k + n)] / (k + n)^2, formed exactly and
+  rounded once.
+- `beta(pairs, views: nil)` and `normal(pairs, views: nil)`:
+  `{ item => [alpha, beta] }` or `{ item => [mean, standard_deviation] }` as
+  they are, with views when given (an item missing from them reads 0).
+
+```ruby
+prior = SkiftetStatistical::Bandit::Prior.amount(mean: 4.0, variance: 2_000.0, strength: 20.0)
+amounts = P.amounts({ "a" => { views: 300, outcomes: 900.0, outcome_squares: 400_000.0 },
+                      "b" => { views: 200, outcomes: 500.0, outcome_squares: 300_000.0 } }, priors: prior)
+amounts.parameters  # => { "a" => [3.0625, 2.0665...], "b" => [2.6363..., 2.6457...] }  ([mean, sd])
+
+P.beta({ "a" => [3.0e6, 7.0e6] }).parameters  # => { "a" => [300000.0, 700000.0] }, scaled to LARGEST_TOTAL
+```
+
+- Items are non-blank Strings, any number of them (an empty set ranks with no
+  head), in input order, which is the tie order everywhere. A Symbol, a blank
+  or repeated name, a name holding a NUL byte (the byte a key joins its parts
+  with) or the same bytes as an earlier name in another encoding is an
+  `ArgumentError` when the set is built; so is a Hash of priors or views that
+  names something that is not an item, or two keys naming one item.
+- One pair everywhere. A Beta pair whose total is above `LARGEST_TOTAL` (1e6)
+  is scaled down to it, its mean kept, in `parameters`: the one pair every draw
+  (`rank`, `pick` and `values`, from any source), every odds call (exact or
+  Monte Carlo), `summary`'s P(best) and loss and `greedy` read. The pairs as
+  given feed `summary`'s means and intervals alone. A scaled pair never sums
+  above `LARGEST_TOTAL`, so a set built from another set's `parameters` keeps
+  them bit for bit.
+- A Beta parameter above 0 but below `BetaArgmax::SMALLEST_PARAMETER` (1e-6)
+  builds: the quantile draws (a key or given uniforms), every odds call and
+  `summary` refuse it, and the RNG draws take it.
+
+### The order rule (`rank`, `pick`)
+
+```ruby
+set.rank(key: "k", may_lead: %w[b c], min_views: 20)   # only b or c may lead; a leader needs 20 views
+set.rank(rng: Random.new(1), pinned: { 0 => "c" }, top: 2).items       # => ["c", "a"]
+set.rank(uniforms: { explore: 0.5, priority: { "a" => 0.1, "b" => 0.2, "c" => 0.3 },
+                     draw: { "a" => 0.5, "b" => 0.5, "c" => 0.5 } }).items  # => ["a", "c", "b"]
+set.pick(key: %w[list visit-1], explore: 0.1)           # => a Choice: item, head, branch, draws
+# Order#repin: rank again with new pins under the held rule (shuffle and explore 0, no may_lead,
+# min_views 0, the same top), on the order's own draws and the source as rank read it
+set.rank(key: "k", explore: 0.1).repin({ 0 => "c" })   # == set.rank(key: "k", pinned: { 0 => "c" })
+```
+
+The rule: `shuffle:` and `explore:` (each in [0, 1], summing to at most 1),
+`may_lead:` (the items that may lead; nil lets every free item lead),
+`min_views:` (0), `pinned:` (`{ position => item }`, 0-based) and `top:` (nil:
+every item). Pinned items keep their positions and draw nothing; the free items
+fill the other positions in order. With the branch value c: below `shuffle` the
+order is `:shuffled` (by priority); below `shuffle + explore`, when a contender
+has at least `min_views` views, it is `:explored` (the eligible item of smallest
+priority leads, the rest follow by draw); otherwise it is `:thompson` (the
+largest draw leads, the rest follow by draw). Ties go to the earlier item.
+
+`rank` answers an `Order`: `items` (the first `top`, pinned items at their
+positions), `leader` (the free head when it has at least `min_views` views,
+else nil), `branch` and `draws` (each free item's posterior value; none on the
+shuffled branch). `pick` is `rank` with top 1 and no pins, answering a `Choice`:
+`item` (the leader), `head`, `branch` and `draws`. Both are frozen; `==`
+compares those four members.
+
+Exactly one source of randomness:
+
+- `key:` (a String, or an Array of parts): the branch value is
+  `Draw.uniform_for(*key, "explore")`, an item's priority
+  `uniform_for(*key, "priority", item)` and its draw
+  `uniform_for(*key, "draw", item)`. The same key draws the same order in every
+  process with nothing stored, and no item's uniforms depend on another item:
+  over 1 000 keys with `shuffle: 0.1` and no exclusion or pin, an added item
+  never changed the others' relative order (with an item pinned at position 1
+  it did on 352 of them, as the added item takes a free slot ahead of the pin).
+- `uniforms:` (`{ explore:, priority: { item => Float }, draw: { item => Float } }`):
+  the same three, given.
+- `rng:` (anything that answers `rand`): one branch value when
+  `shuffle + explore` is above 0, one priority a free item on the shuffled or
+  explored branch, then one `Sampler` draw a free item where the branch draws,
+  in item order, and nothing else from the stream.
+
+A key or given uniforms draw by quantile: a Beta item at
+`BetaArgmax.position(u, alpha, beta)`, compared by that position so that two
+draws never tie by rounding, and a Normal item at mean + sd times
+`Significance.normal_quantile(u)`, u on the open grid (`Draw.open_uniform`). An
+RNG draws by `Sampler`. Two Normal draws are compared, from every source, by the
+exact sign of (mean_i - mean_j) + (sd_i z_i - sd_j z_j), each mean + sd * z
+formed exactly, never rounded, so they never tie or misorder where a standard
+deviation lies below a rounding of its mean; `draws` answers the rounded values.
+Each source draws exactly from the posteriors, so one set of odds (below) covers
+all three.
+
+Refused, each an `ArgumentError` before any draw and before anything is taken
+from an RNG: a rule outside its bounds, a pinned position or name that is not an
+item, a name pinned twice, a `may_lead` name that is not an item, `top` below 1,
+no source or more than one, a malformed `uniforms` Hash, and under a key or
+given uniforms a Beta parameter below 1e-6. An RNG's own answer is checked as
+it comes: one that is not a Float in [0, 1), or a raise from its `rand`, is an
+`ArgumentError` at that answer, after the draws taken before it.
+
+`greedy(may_lead: nil)` is the contender with the largest posterior mean on
+`parameters` (`BetaArgmax.greedy`'s rule, for a set of any size); `values(rng:)`
+is one posterior draw an item, in item order.
+
+### Odds of a pick, an order and a position
+
+The posterior set answers the probability of what its rule draws, under that
+same rule (`shuffle`, `explore`, `may_lead`, `min_views`, and for orders
+`pinned` and `top`):
+
+```ruby
+set = SkiftetStatistical::Bandit::Posteriors.beta({ "a" => [ 1.0, 1.0 ], "b" => [ 2.0, 1.0 ] })
+set.pick_probabilities(explore: 0.1)[:heads]  # => { "a" => 0.35000000000000003, "b" => 0.6500000000000001 }
+set.order_probability(%w[b a])                # => { probability: 0.6666..., method: :exact, standard_error: 0.0 }
+set.positions[:probabilities]                 # => { "a" => [0.3333..., 0.6666...], "b" => [0.6666..., 0.3333...] }
+set.order_summary(%w[b a])                    # => { probability: 0.6666..., positions: { "a" => [...], "b" => [...] } }
+set.rank(key: "k1").probability               # => 0.6666..., the odds of the order that key drew
+
+SkiftetStatistical::Bandit::Posteriors.mixture(
+  shares: { "x" => 0.25, "y" => 0.75 },
+  probabilities: { "x" => { "a" => 0.5, "b" => 0.5 }, "y" => { "a" => 0.2, "c" => 0.8 } },
+)                                             # => { "a" => 0.275, "b" => 0.125, "c" => 0.6000000000000001 }
+```
+
+- `pick_probabilities` gives each item's probability of heading the pick
+  (`heads`) and of being the pick's leader (`leaders`, nil for no leader);
+  `order_probability(order)` the probability that the rule's whole order
+  begins with `order`; `positions` each item's probability at each slot;
+  `order_summary(order)` the posterior alone, with no rule: the probability
+  that `order` is the best one and each item's probability at each position,
+  for a set of at most `EXACT_ORDER_MAX` (10) items. `Choice#probability` and
+  `Order#probability` answer the same odds for a pick or an order the set made,
+  computed on the first call and kept.
+- `Posteriors.mixture(shares:, probabilities:)` is the probability that a
+  two-layer draw shows each item: the sum over the first layer's branches of a
+  branch's share times its odds of the item.
+- They are exact, by quadrature, up to `EXACT_PICK_MAX` (20) contenders for the
+  pick and up to `EXACT_ORDER_MAX` (10) free items for orders and positions
+  when no free item is barred from leading. The pick's P(largest) is
+  `BetaArgmax.probabilities` or `NormalArgmax.probabilities`. The order odds
+  sum on every free item's quantiles at 400 levels (an internal grid, not a
+  public constant), each sum on points where its own item's points keep their
+  digits: Betas share one grid in the position on a log scale the rule
+  compares, and each Normal sums on its own points in its own standardised
+  variable, the other items read there, so a
+  parameter near 1e-6, a standard deviation small beside its mean, or two
+  narrow items beside a far one loses no point; each sum is extrapolated from
+  the points and their every other level. They read within 4e-6 of closed
+  forms, inside the library's stated 1e-4.
+- Otherwise each is one of two stated Monte Carlo forms, `draws:` (20 000)
+  draws on `Random.new(seed:)` (seed 0), so the same call answers the same
+  figures, with `method: :monte_carlo` and the largest standard error: above
+  `EXACT_PICK_MAX` contenders the pick counts how often each contender's draw
+  is the largest; orders and positions (an item barred from leading, or more
+  than `EXACT_ORDER_MAX` free items) count the rule's own visits. Both draw on
+  the scaled pairs (`parameters`), the pairs the exact odds read. A Beta
+  parameter far below 1 draws 0.0 in a share of `Sampler`'s draws (about a
+  tenth at 0.003), where two such draws tie and the tie goes to the earlier
+  item, so below about 0.003 the Monte Carlo reads that tie rule as well.
+- A Beta parameter below `BetaArgmax::SMALLEST_PARAMETER` (1e-6) is an
+  `ArgumentError` for every odds call at every size, exact or Monte Carlo,
+  over the items a keyed draw of the same set and rule refuses.
+
+Measured against the rule's own visits in `odds_simulation_spec.rb` (below):
+every head and position within 2.75 standard errors of its exact value over
+2 * 10^5 visits a fixture.
+
+### Summaries (`summary`)
+
+```ruby
+set = SkiftetStatistical::Bandit::Posteriors.beta({ "a" => [ 2.0, 8.0 ], "b" => [ 3.0, 7.0 ] },
+                                                  views: { "a" => 120.0, "b" => 340.0 })
+summary = set.summary(credible_mass: 0.95)
+# => { "a" => { views: 120.0, mean: 0.2, lower: 0.0281..., upper: 0.4825..., p_best: 0.2882...,
+#               expected_loss: 0.1335... },
+#      "b" => { views: 340.0, mean: 0.3, lower: 0.0748..., upper: 0.6000..., p_best: 0.7117...,
+#               expected_loss: 0.0335... } }
+SkiftetStatistical::Bandit::Allocator.from_summary(arms: %w[a b], summary: summary,
+                                                   exposures: { "a" => 120, "b" => 340 },
+                                                   status: "running", winner_arm: nil)
+set.summary(among: [])   # views, mean and interval only, for a set of any size
+set.means                # => { "a" => 0.2, "b" => 0.3 }, the means alone: no interval, no quantile
+```
+
+`summary(credible_mass: 0.95, among: nil)` gives every item, in item order, its
+views, its posterior mean and its equal-tailed interval, read on the pair as
+given, and for the items `among` names (nil: every item; at most
+`EXACT_PICK_MAX`) the exact P(best) and expected loss, E[the largest] less the
+item's mean, among those items, on `parameters` (`BetaArgmax.probabilities` and
+`.expected_maximum`, or `NormalArgmax`'s). A loss that rounds below 0 is
+answered as 0. The answer is `Allocator.from_summary`'s `summary:` as it is, so
+a pass on exact figures is one call more. `among: []` computes no P(best) and no
+loss; `means` answers the means alone (frozen, summary's mean bit for bit) and
+computes no interval, so it calls no quantile. A Beta interval is
+`BetaFunction.quantile`, accurate to about 2e-10 up to totals (alpha + beta)
+near 10^8; beyond about 3 * 10^8 one bound can fall on or past the mean (at a
+mean of 1/2 the lower bound lies 0.0025 standard deviations above it at
+4 * 10^8). A Normal interval is the mean less and plus its standard deviation
+times the Normal quantile, the tail read on the open grid.
+
+### Priors (`Bandit::Prior`)
+
+A yes/no prior is a Beta pair `[alpha, beta]`; an amounts prior a
+`Prior::Amount` (a mean per view, a variance per view and a strength in views).
+Three rules are written once, and every other prior is built from them: a mean
+held at a strength (`given`), a mean shrunk toward a prior mean (`pooled_mean`)
+and the leave-one-out rule (`borrowed`: what a group holds once the item's own
+evidence is taken out, views at least 0 and outcomes within [0, views]).
+
+```ruby
+PR = SkiftetStatistical::Bandit::Prior
+
+PR.flat                                         # => [1.0, 1.0]
+PR.given(mean: 0.1, strength: 20.0)             # => [2.0, 18.0]
+PR.amount(mean: 4.0, variance: 2_000.0, strength: 20.0)
+PR.borrowed(group: { views: 1_000, outcomes: 100 }, own: { views: 200, outcomes: 50 })
+# => { views: 800.0, outcomes: 50.0 }
+PR.pooled(group: { views: 1_000, outcomes: 100 }, own: { views: 200, outcomes: 50 }, strength: 20.0)
+# => [1.399..., 20.600...]: the borrowed mean (1 + 50) / (2 + 800) held at 2 + 20 views
+PR.pooled_mean(views: 40, outcomes: 8, prior_mean: 0.1, strength: 20.0)   # => 0.1666...
+PR.tilts({ "a" => 2.0, "b" => 0.5, "c" => 1.0 }, clip: [ 0.5, 1.5 ])     # => { "a" => 1.5, "b" => 0.5, "c" => 1.0 }
+PR.chain(levels: [ { views: 1_000, outcomes: 120, strength: 20.0 },
+                   { views: 200, outcomes: 30, strength: 30.0 } ], root_mean: 0.1)
+# => [3.365..., 26.634...]: the top level's mean, the lower level taken out, held at its 30 views
+```
+
+- `pooled(group:, own:, strength:, base: FLAT)`: the borrowed mean
+  (base_alpha + y) / (base_alpha + base_beta + n) held at
+  base_alpha + base_beta + min(strength, n), so a large group never outweighs
+  the item's own evidence for long.
+- `pooled_new(others:, group:, own:, weight: 2.0)`: a new item's prior, the
+  others' borrowed evidence pooled into (1 + Y) / (2 + N) at `weight`, plus the
+  new item's own borrowed evidence.
+- `tilts(multipliers, clip:)`: each multiplier over the geometric mean of all
+  of them, clamped to `clip`, so tilts reorder items without raising them all.
+- `chain(levels:, root_mean:, tilt: 1.0, clip: [0.001, 0.999])`: the prior of
+  an item at the bottom of nested levels, top first, each level's mean shrunk
+  toward the one above with the level below taken out.
+- `pooled_amount(group:, own:, strength:)`: the borrowed mean and variance of
+  amounts at min(strength, n); it refuses a group with nothing left out or a
+  variance of 0, and the caller then states its own scale with `amount`.
+
+### Decay (`Bandit::Decay`)
+
+```ruby
+SkiftetStatistical::Bandit::Decay.weight(72, half_life: 72, cap: 336)   # => 0.5
+SkiftetStatistical::Bandit::Decay.weight(337, half_life: 72, cap: 336)  # => 0.0
+rows = [ { age: 0, views: 10, outcomes: 3 }, { age: 72, views: 20, outcomes: 4 } ]
+SkiftetStatistical::Bandit::Decay.fold(rows, half_life: 72, cap: 336)
+# => { views: 20.0, outcomes: 5.0, outcome_squares: 0.0 }
+```
+
+One formula, 2 ** (-age / half_life), and 0.0 for an age above the cap; age,
+half-life and cap share one unit of the caller's choosing. `fold` weighs every
+sum of a row (views, outcomes and outcome squares alike), so the folded tally is
+what a posterior reads. The fold is linear, so a caller that sums in a database
+groups its rows by age bucket and folds the buckets.
+
+### Keyed uniforms and the draw by weight (`Bandit::Draw`)
+
+```ruby
+D = SkiftetStatistical::Bandit::Draw
+
+D.uniform("t")                                # => 0.8895498694938413
+D.uniform_for("t", "explore")                 # => 0.856909028643178
+D.seed_for("t", "explore")                    # => 15807181545831752473, for Random.new
+D.weighted({ "a" => 1, "b" => 3 }, 0.5)       # => ["b", 0.75]
+D.from_weights({ "a" => 1, "b" => 3 }, 0.5)   # => "b"
+D.open_uniform(0.0)                           # => 1.1102230246251565e-16 (2**-53)
+```
+
+A uniform is the first 8 bytes of SHA256 of the text, big-endian, shifted right
+by 11 and divided by 2**53: the same text gives the same uniform in every
+process, so a draw keyed by a visit, a pass or a test comes back without being
+stored. `uniform_for` joins its parts by one NUL byte (nil reads "", a part
+holding a NUL byte is refused); `seed_for` is those 8 bytes as an Integer.
+`weighted` is the one draw by weight: a weight that is not a finite number above
+0 counts 0, all 0 counts every key 1, and it answers the key with its share, the
+probability that a uniform draw answers it; `from_weights` is its key. Keys are
+any objects, answered as given. `open_uniform` clamps a uniform to
+[2**-53, 1 - 2**-53], the one reading of a quantile draw's uniform.
+
+### Normal argmax (`Bandit::NormalArgmax`)
+
+```ruby
+NA = SkiftetStatistical::Bandit::NormalArgmax
+
+NA.probabilities([ [ 0.0, 1.0 ], [ 0.0, 1.0 ] ])                # => [0.5, 0.5]
+NA.probabilities([ [ 5.0, 0.4 ], [ 5.3, 0.5 ] ], epsilon: 0.1)  # => [0.3377..., 0.6622...]
+NA.expected_maximum([ [ 0.0, 1.0 ], [ 0.0, 1.0 ] ])             # => 0.5641... (1 / sqrt(pi))
+```
+
+`BetaArgmax`'s rule on independent Normals `[mean, standard_deviation]`, 1 to 20
+members: the probability that each is the largest, mixed with epsilon / k, and
+E[the largest]. Each member's probability is its own integral in its own
+standardised variable, so a narrow member far from the others is weighed on its
+own scale; each answer lies within 2 k (k + 1) * 1e-10 + 2e-12 of the exact
+probability for k members (1.2e-9 for two, 8.4e-8 for 20).
+
+### A pass with a hold on its win (`Bandit::Pass`)
+
+```ruby
+hold = SkiftetStatistical::Bandit::WinHold.new(leading_arm: "a", leading_since: now - 90_000, now: now,
+                                               last_pass_at: now - 600)
+SkiftetStatistical::Bandit::Pass.call(status: "running", hold: hold) do |hold_satisfied, rng|
+  SkiftetStatistical::Bandit::Allocator.call(arms: %i[control a], tallies: tallies, status: "running",
+                                             winner_arm: nil, previous_weights: weights, rng: rng,
+                                             draws: 20_000, hold_satisfied: hold_satisfied)
+end
+# => the crown's answer (phase: :won, winner: :a, leader: :a, ...) and ready: true
+```
+
+The probe yields (false, `Random.new(seed)`), so a leader gets the step, never
+the won split. The pass is ready when the status reads "running", the probe
+names a leader and `hold.satisfied_for?(leader)` answers true; then, and only
+when `crown:` is true (the default), the block runs again with (true, a fresh
+`Random.new(seed)`), so the probe and the crown read the same draws and only the
+decision changes. The answer is the last block's Hash plus `ready:`; with
+`crown: false` a ready leader keeps the probe's answer and `ready: true` says it
+would have been crowned. `seed:` defaults to `Random.new_seed`; a given seed
+makes the pass repeatable.
+
+### Amounts: what the Normal posterior gets wrong
+
+Under about 30 non-zero amounts the mean of amounts is right-skewed and the
+Normal posterior understates its upside; the prior's k views at v0 keep it
+wide, and the shuffle or exploration share keeps the item shown. One large
+amount x moves a mean of n views by x / n, so cap amounts before summing them;
+`min_views` holds the lead until an item has enough views. Draws and interval
+bounds may fall below 0: they are answered as computed, and the order rule
+compares draws only. When `Prior.pooled_amount` refuses (nothing borrowed, or a
+variance of 0), state a scale with `Prior.amount`. Measured in
+`order_simulation_spec.rb` (below): on amounts at 300, 1 000 and 3 000 visits a
+day the best item was on top on day 28 in every run, and the rule lost 4.3, 2.6
+and 1.9 % of the best order's expected outcomes.
+
+### Inputs
+
+Every number the code new in 0.4.0 reads must lie in one input domain: a real
+number whose Float is finite and at most `SkiftetStatistical::Numbers::LARGEST`
+(1e100) either side of 0. A larger number, a NaN, an infinity or a String is an
+`ArgumentError` where it is read, so no sum or product of inputs can leave a
+Float on its way to an answer, and every answer is checked finite before it is
+returned. A caller's object is called only where it must be (a key part's
+`to_s`, a name's `hash` or `eql?`, a list's `each`, an RNG's `rand`); what it
+raises there is an `ArgumentError` naming the input. A caller's String, Hash or
+Array is read by its contents, never by its own methods, so a missing key reads
+as absent whatever default the Hash holds. A list is any Enumerable but a Hash,
+read once by its `each`.
+
+### Costs
+
+CPU time a call with YJIT, Ruby 3.4.9, on one development machine on
+2026-11-02 while other work kept it busy (CPU time moves less with the load than
+the wall clock does):
+
+| Call | Time |
+|---|---|
+| `Posteriors.yes_no`, 8 items | 0.055 ms |
+| `Posteriors.amounts`, 2 items | 0.034 ms |
+| `rank(key:, explore: 0.1)`, 8 Beta items, totals up to 1e3 | 0.21 ms |
+| the same, totals up to 1e5 | 0.54 ms |
+| the same, 8 Normal items | 0.08 ms |
+| `rank(rng:, shuffle: 0.1)`, 8 Beta or Normal items | 0.017 ms |
+| `BetaArgmax.position`, Beta(3, 300) / Beta(41, 960) / Beta(4 000, 96 000) | 0.019 / 0.028 / 0.057 ms (0.3.0's bisection: 0.11 / 0.29 / 0.92 ms) |
+| `pick_probabilities(explore: 0.1)`, 5 Betas / 5 Normals | 24 / 1.6 ms |
+| `summary`, 5 Betas / 20 Betas / 5 Normals | 46 / 440 / 3.8 ms |
+| `summary(among: [])`, 60 Betas | 26 ms |
+| `NormalArgmax.probabilities`, 20 members | 91 ms |
+| `order_probability` (exact), 5 Betas / 5 Normals | 145 / 14 ms |
+| `positions` (exact), 5 / 10 Betas | 160 / 560 ms |
+| `positions(explore: 0.1)` (exact), 10 Betas | 1.2 s |
+| `order_probability` (Monte Carlo, 20 000 visits), 5 Betas | 200 ms |
+| `pick_probabilities` (Monte Carlo, 20 000 draws), 21 Betas | 470 ms |
+
+A draw is cheap enough for every visit; the odds and summaries belong off the
+request path, once a pass (a set keeps the grids of its exact orders and
+positions, so later odds calls on the same set cost less).
+
+## Example: an ordered list, one visit at a time
+
+```ruby
+P = SkiftetStatistical::Bandit::Posteriors
+
+# Once a pass (hourly, say): the posterior set from stored tallies, where a view
+# counts only for an item the visit reached, kept as its pairs.
+set = P.yes_no(tallies)                          # { "a" => { views:, outcomes: }, ... }
+cache.write("list:pairs", { pairs: set.parameters, views: set.views })
+
+# Each visit: the set rebuilt from its pairs (bit for bit) and ranked by the
+# visit's key, so a visit sees the same order on every request and nothing is
+# stored per visit.
+kept = cache.read("list:pairs")
+order = P.beta(kept[:pairs], views: kept[:views]).rank(key: [ "list", visit_id ], shuffle: 0.1)
+order.items                                      # show the items in this order
+
+# Off the request path, once a pass: each item's odds at each position under
+# that rule, for an estimate that weighs a view by 1 / its probability.
+set.positions(shuffle: 0.1)[:probabilities]
 ```
 
 ## A/B-test allocation (`Bandit::Allocator`)
 
 The decision an A/B test's allocation job makes on every pass: how much traffic
-each arm gets next, and whether an arm has won. It is f1's rule, moved here;
-pure (no clock, no state), with the randomness only from the injected `rng`.
+each arm gets next, and whether an arm has won. It is the rule an app's
+allocation job ran, moved here; pure (no clock, no state), with the randomness only from the injected `rng`.
 
 ```ruby
 A = SkiftetStatistical::Bandit::Allocator
@@ -301,8 +752,8 @@ never decided on. Tallies and previous weights may use Symbol or String keys
 (rows read back from JSON); previous weights that do not name exactly the arms
 with finite numbers read as none.
 
-Every number above is a setting of `Allocator::Config`, with f1's values as
-defaults:
+Every number above is a setting of `Allocator::Config`, with the defaults
+below:
 
 ```ruby
 config = A::Config.new(warmup_exposures: 100, floor: 0.05) # the rest stay
@@ -426,7 +877,8 @@ state = hold.after_pass(result[:leader]) # => the leading arm and since, to stor
 A run of passes with a gap longer than `max_gap_seconds` (or no previous pass)
 is interrupted: not satisfied, and a leader starts over. Call the allocator a
 second time with the same seed and `hold_satisfied: false` when the arm it
-crowns is not the arm that held (`satisfied_for?`), as f1's job does.
+crowns is not the arm that held (`satisfied_for?`); `Bandit::Pass` (above)
+makes both calls in one.
 
 ## Linear value of several rates (`LinearValue`)
 
@@ -787,6 +1239,31 @@ go to the lower index.
 symmetric, computed once per n and kept, frozen. `BetaFunction.log_density` is
 -Infinity outside (0, 1); `regularized` and `quantile` are unchanged.
 
+Since 0.4.0 three more answers sit beside these, and `probabilities`, `pick` and
+`greedy` answer as in 0.3.0 (`pick` still compares its own position):
+
+```ruby
+BA.position(0.5, 2.0, 2.0)                         # => 0.0, the draw 1/2
+BA.distribution(0.3, 2.0, 8.0)                     # => 0.8039967659999996
+BA.expected_maximum([ [ 1.0, 1.0 ], [ 1.0, 1.0 ] ])  # => 0.6666666666666667 (2/3)
+```
+
+- `position(uniform, alpha, beta)`: where the draw of Beta(alpha, beta) at a
+  uniform lies, log(2 x) up to 1/2 and -log(2 (1 - x)) beyond, a key that
+  rounds at neither end; the posterior set's quantile draws compare by it. A
+  guarded Newton step on the same distribution function. Against `pick`'s own
+  bisection (0.3.0's position), recorded on 30 members at 1 000 uniforms each,
+  the spec bounds |position - recorded| / max(1, |recorded|), an absolute
+  error where the recorded position lies within 1 of 0 and a relative one
+  beyond: 1e-12 (measured at most 4.7e-13), 1e-9 where alpha + beta exceeds
+  10^4 (measured 3.0e-13) and 1e-8 at the smallest parameter (measured
+  9.5e-11). It takes 0.019 / 0.028 / 0.057 ms at Beta(3, 300) / Beta(41, 960) /
+  Beta(4 000, 96 000) where the bisection took 0.11 / 0.29 / 0.92 ms.
+- `distribution(x, alpha, beta)`: that distribution function itself, the one
+  `probabilities`, `pick`, `position` and `expected_maximum` read, bit for bit.
+- `expected_maximum(params)`: E[the largest member], 1 less the integral over
+  (0, 1) of the product of the members' distribution functions.
+
 Measured (`argmax_accuracy_simulation_spec.rb`, below): on 30 fixtures, sharp
 ones with alpha + beta up to 2 * 10^5 among them, `pick`'s frequencies over
 10^4 draws came within 2.44 standard deviations of `probabilities`, and
@@ -852,29 +1329,35 @@ half).
 
 ## Bandit simulations: measured results
 
-`spec/simulations` holds eight files, tagged `simulation: true` and run only
+`spec/simulations` holds ten files, tagged `simulation: true` and run only
 with `SIMULATIONS=1` (`bundle exec rspec spec/simulations`; CI's simulations
 job runs them nightly, by hand, and on a change to the code they measure). Each
 example asserts its bounds; the figures beside the bounds were measured with
-the same code and seeds, and the six files new in 0.3.0 print theirs through
-RSpec's reporter (the JSON formatter keeps them under "messages"). Every run is
-seeded, so each count below is exact for this version of the code, and every
-shape is generated here from round generic values. Measured on 2026-10-31 with
-skiftet_statistical 0.3.0 on Ruby 3.4.9, YJIT on, as CI runs them.
+the same code and seeds, and the files new in 0.3.0 and 0.4.0 print theirs
+through RSpec's reporter (the JSON formatter keeps them under "messages"). Every
+run is seeded, so each count below is exact for this version of the code, and
+every shape is generated here from round generic values. The eight files from
+0.2.0 and 0.3.0 were measured on 2026-10-31 with skiftet_statistical 0.3.0, and
+again on 2026-11-02 with 0.4.0, every count the same; the two files
+new in 0.4.0 were measured on 2026-11-02. Ruby 3.4.9, YJIT on, as CI runs
+them.
 
 The two simulations from 0.2.0 replay A/B tests through `Bandit::Allocator` (and
 `Bandit::WinHold`) in memory: every pass, 40 visits are drawn by the current
 weights, each exposure counts 1 / the weight it was drawn under, and the
 allocator is called with the previous weights, as an allocation job does every
 15 minutes. Their three examples assert the bounds; the other figures were measured with the
-same code and seeds. Moved from f1 (its `allocator_simulation_oracle_spec.rb`
-and `win_hold_simulation_spec.rb`) with the same seeds, runs, passes, draws and
-bounds; measured again here on 2026-10-15 with skiftet_statistical 0.2.0 and
-Ruby 3.4.9, and every count f1 had recorded came out the same.
+same code and seeds. Moved from the app that first ran them, with the same
+seeds, runs, passes, draws and bounds; measured again here on 2026-10-15 with
+skiftet_statistical 0.2.0 and Ruby 3.4.9, and every count the app had recorded
+came out the same.
 Measured again on 2026-10-31 with 0.3.0, the three asserted examples counted
 exactly as below (15 / 200; 0 / 100, an equal arm in 21 / 100; worse 0, better
 46, undecided 154 / 200). The other counts are 0.2.0's, from an allocator that
-0.3.0 keeps bit for bit for every call that declares no per-arm share.
+0.3.0 and 0.4.0 keep bit for bit for every call that declares no per-arm share.
+In 0.4.0 these simulations draw a visit's arm by `Draw.from_weights`, and over
+all 12,263,200 draws of the four files that draw by weight it answered the
+draw the files had written by hand every time.
 
 ### The automatic win (`allocator_simulation_spec.rb`)
 
@@ -892,8 +1375,8 @@ worse arm is never crowned.
 ### The hold (`win_hold_simulation_spec.rb`)
 
 Two arms, 11 % against 10 % (the worse arm), 400 passes of 40 visits (100
-hours), 200 runs (seeds 40 261 003 + run). The decision step is f1's: the
-allocator with `hold_satisfied: hold.satisfied?`, and the same seed again with
+hours), 200 runs (seeds 40 261 003 + run). The decision step is an allocation
+job's: the allocator with `hold_satisfied: hold.satisfied?`, and the same seed again with
 `hold_satisfied: false` when the arm it crowns is not the arm that held.
 
 - WITHOUT the hold (the allocator alone, `hold_satisfied: true` at every pass):
@@ -1000,11 +1483,13 @@ worth uniform [0.25, 0.75], 40 visits a pass.
   that picks one of three candidates (rates 0.30, 0.20 and 0.10). The warm
   option's candidates are held at 1,000 showings each; the cold option's start
   at Beta(1, 1) and learn from their showings, their best placed first, second
-  or third by run. Each visit's item is drawn by `BetaArgmax.probabilities`
-  (epsilon 0.1), and each option is scored by its greedy pick
-  (`BetaArgmax.greedy`) through `SharedCredit`: a visit credits every option
-  whose greedy pick it showed, with 1 / the visit's probability of showing that
-  item. 30 passes of 80 visits, 100 runs. Bound (asserted): both options' mean
+  or third by run. Each option's candidates are one posterior set
+  (`Posteriors.beta`); each visit's item is drawn by the exact pick odds
+  (`Posteriors#pick_probabilities`, explore 0.1) through `Draw.from_weights`,
+  and each option is scored by its greedy pick (`Posteriors#greedy`) through
+  `SharedCredit`: a visit credits every option whose greedy pick it showed,
+  with 1 / the visit's probability of showing that item, the two layers' odds
+  combined by `Posteriors.mixture`. 30 passes of 80 visits, 100 runs. Bound (asserted): both options' mean
   P(best) in 0.40 to 0.60, and the cold option at its floor at the end in at
   most 10 runs. Measured: 0.5807 and 0.4193 over 3,000 passes, the cold option
   at its floor in 2 of 100. Scored as they ran (each visit crediting its drawn
@@ -1142,28 +1627,122 @@ Measured beside it: 2,000 separate spans, each starting at 0, count 1.2 % fewer
 alarms at reference 0.5 and 3.9 % fewer at 0.25, because every span's first
 steps start from 0.
 
+### The order rule at small-site traffic (`order_simulation_spec.rb`)
+
+A list of K items (3, 5 or 10), each with its own true rate, fixed for a run and
+dealt to the items in a random order a run. Every visit is shown the whole list
+in one order and sees it down to a depth drawn from a reach curve, the share of
+visits that see position l: (1, 0.6, 0.35) at K = 3,
+(1, 0.70, 0.50, 0.35, 0.25) at K = 5 and 0.8^l at K = 10. Each item a visit
+sees yields an outcome at its rate: yes/no, or an amount (log-normal, mean 200,
+sigma 0.9, capped at 2 000). The caller's whole part: a view counts only where
+an item was seen; every hour the set is rebuilt from the tallies
+(`Posteriors.yes_no` on the flat prior, or `Posteriors.amounts` under
+`Prior.amount(mean: 4.0, variance: 2_000.0, strength: 20.0)`), and every visit
+of that hour is shown the set's `rank(rng:, shuffle: 0.10)`. 28 days of 24
+hours, 50 seeded runs a cell (`Random.new(20 261 102 + 50 i + r)` for run r of
+cell i).
+
+Measured: lost, the expected outcomes the shown orders missed against the best
+order (the items by true rate), as a share of the best order's, and the same for
+a fixed order (one random order a run shown to every visit); the posterior-mean
+order (the items by `summary(among: [])`'s means) on days 7 and 28, whether its
+first item is the best one and whether it is the best order exactly. Mixed
+visits: half shallow (reach (1, 0.5, 0.3, 0.15, 0.1), every rate halved), half
+deep (reach (1, 0.9, 0.7, 0.55, 0.4), every rate times 1.5), the known weakness
+of counting views only where seen, as an item shown low is seen mostly by deep
+visits and reads a rate above the one it would show on top. Bound (asserted,
+every cell): lost at most half the fixed order's, and the random share within 4
+standard errors of 0.10 (measured 0.0990 to 0.1003); each cell's own bounds
+below. The reference is the same model run 100 times a cell in another language
+and generator, the figures the bounds were set from with margin (fixed lost /
+lost / best on top day 7 / day 28 / exact order day 28); 50 runs and another
+generator read near them, not equal to them.
+
+| Rates (true) | Visits a day | Fixed order lost | Lost | Best on top, day 7 | Best on top, day 28 | Exact order, day 28 | Bound (asserted) | Reference (100 runs) |
+|---|---|---|---|---|---|---|---|---|
+| five, close: 5, 4.5, 4, 3.5, 3 % | 300 | 8.0 % | 2.4 % | 74 % | 88 % | 62 % | day 28 >= 75 %, exact >= 35 %, lost <= 4.5 % | 8.3 / 2.8 / 69 / 90 / 54 |
+| five, close | 1 000 | 7.4 % | 1.6 % | 82 % | 100 % | 94 % | day 28 >= 90 %, exact >= 75 %, lost <= 3.0 % | 7.6 / 1.6 / 91 / 99 / 91 |
+| five, close | 3 000 | 7.4 % | 1.1 % | 94 % | 100 % | 100 % | day 28 >= 90 %, exact >= 90 %, lost <= 2.0 % | 7.7 / 1.1 / 99 / 100 / 100 |
+| five, clear: 8, 6, 5, 4, 3 % | 300 | 14.1 % | 2.5 % | 98 % | 100 % | 86 % | day 7 >= 90 % | 12.8 / 2.4 / 100 / 100 / 97 |
+| five, clear | 1 000 | 14.3 % | 1.7 % | 100 % | 100 % | 100 % | day 7 >= 90 % | 12.8 / 1.7 / 100 / 100 / 100 |
+| five, clear | 3 000 | 13.9 % | 1.5 % | 100 % | 100 % | 100 % | day 7 >= 90 % | 13.6 / 1.5 / 100 / 100 / 100 |
+| three: 5, 4, 3 % | 1 000 | 7.7 % | 1.1 % | 98 % | 100 % | 100 % | day 28 >= 90 % | 7.0 / 1.1 / 100 / 100 / 100 |
+| ten: 6 % down to 1.5 % by 0.5 | 3 000 | 19.6 % | 2.2 % | 100 % | 100 % | 100 % | day 28 >= 90 % | 18.6 / 2.2 / 98 / 100 / 100 |
+| five amounts: 4, 3, 2.5, 2, 1.5 % | 300 | 13.8 % | 4.3 % | 82 % | 100 % | 68 % | day 28 >= 85 %, lost <= 6 % | 13.1 / 4.3 / 88 / 98 / 53 |
+| five amounts | 1 000 | 13.7 % | 2.6 % | 92 % | 100 % | 84 % | day 28 >= 95 %, lost <= 4 % | 12.4 / 2.6 / 98 / 100 / 88 |
+| five amounts | 3 000 | 12.6 % | 1.9 % | 100 % | 100 % | 100 % | day 28 >= 95 %, lost <= 3 % | 12.9 / 1.8 / 100 / 100 / 98 |
+| five, close, mixed visits | 300 | 6.9 % | 2.3 % | 78 % | 94 % | 70 % | day 28 >= 75 % | 6.4 / 2.4 / - / 90 / 58 |
+| five, close, mixed visits | 1 000 | 5.5 % | 1.5 % | 82 % | 98 % | 96 % | day 28 >= 90 % | 6.2 / 1.5 / - / 99 / 95 |
+
+At 300 visits a day the order rule loses a fifth to a third of what a fixed
+order loses, and the posterior-mean order finds the best item first in
+most runs by day 28; at 1 000 and more it finds the best order exactly in most.
+The mixed cells hold their bounds, though the deep visits flatter the items
+shown low.
+
+### The odds against the rule's visits (`odds_simulation_spec.rb`)
+
+Visits: 2 * 10^5 calls of `rank(rng:)` a fixture on one seeded Random (seed
+20 261 131); every head and every position against its exact value
+(`pick_probabilities`, `positions`), and the orders by one chi-square test
+against `order_probability` (each order with n p >= 5 its own bin, the rest
+pooled into one). Bound (asserted): every head and position within 4 standard
+errors, sqrt(p (1 - p) / n), the chi-square's p-value above 0.001, and no order
+seen that the exact odds give no probability. Items a, b, c, ... in the order
+their pairs are listed; slots count from 0.
+
+| Fixture | Rule | Largest gap (standard errors) | Orders' chi-square | p |
+|---|---|---|---|---|
+| five Betas: [0.02, 19.98], [3, 60], [4, 70], [6, 95], [2, 45] | shuffle 0.1, explore 0.1 | 2.75 (d at slot 2) | 137.5 on 119 degrees | 0.1186 |
+| four Betas: [0.3, 20], [1, 20], [2, 30], [5, 90]; views 50, 400, 400, 400 | explore 0.2 among items of at least 100 views | 1.12 (a at slot 1) | 15.8 on 23 | 0.8656 |
+| four Normals near 5 a view: [5.0, 0.4], [5.3, 0.5], [4.8, 0.3], [5.1, 0.8] | shuffle 0.05 | 1.71 (c at slot 1) | 23.3 on 23 | 0.4457 |
+| the four Betas above, c pinned at slot 2 | shuffle 0.1 | 1.33 (a at slot 3) | 2.3 on 5 | 0.8086 |
+| five Normals of mixed widths: [1.0, 1.0], [1.5, 0.5], [0.5, 2.0], [1.2, 0.2], [0.8, 0.7] | explore 0.1, the top 2 | 1.34 (e as head) | 12.2 on 19 | 0.8781 |
+
+Joint draws: 10^6 a fixture (seed 20 261 141), one draw an item, in order; how
+often each item is the largest against `summary`'s p_best (and, for Normals,
+`NormalArgmax.probabilities`, which read the same), and the mean of max - X_i
+against its expected loss. Bound (asserted): each within 4 standard errors of
+the draws. Measured, the gap of each item in standard errors:
+
+| Fixture | P(best) | Expected loss |
+|---|---|---|
+| the four Normals near 5 a view | 1.60, 0.28, 1.57, 0.82 | 0.87, 0.74, 0.46, 1.34 |
+| the five Normals of mixed widths | 0.41, 1.14, 0.79, 1.30, 0.01 | 1.20, 0.44, 0.55, 0.04, 0.39 |
+| four Betas: [12, 88], [15, 85], [9, 91], [3, 17] | 1.37, 1.07, 0.37, 0.24 | 0.26, 0.18, 0.21, 0.31 |
+| the four Betas with an alpha of 0.3 | 1.44, 1.16, 1.10, 1.61 | 1.20, 0.85, 1.44, 0.76 |
+
 ### Run time
 
-On one development machine, Ruby 3.4.9 with YJIT, 2026-10-31 (seconds, the sum
-of each file's examples):
+On one development machine, Ruby 3.4.9 with YJIT, in seconds, both columns
+measured the same way: each figure is the sum of a file's examples' own run
+times as RSpec reports them, Ruby's boot and the file's load left out. 0.3.0 ran
+on 2026-10-31 with the machine otherwise idle, 0.4.0 on 2026-11-02 while other
+work kept it busy (a load average of 31 to 46), so the two columns differ by the
+load as well as by the code.
 
-| File | Examples | Seconds |
-|---|---|---|
-| `allocator_simulation_spec.rb` | 2 | 150 |
-| `win_hold_simulation_spec.rb` | 1 | 132 |
-| `value_allocation_simulation_spec.rb` | 6 | 56 |
-| `two_layer_simulation_spec.rb` | 3 | 68 |
-| `tree_recovery_simulation_spec.rb` | 3 | 178 |
-| `contrasts_simulation_spec.rb` | 2 | 17 |
-| `argmax_accuracy_simulation_spec.rb` | 2 | 232 |
-| `change_test_simulation_spec.rb` | 4 | 1 |
-| All | 23 | 833 (about 14 minutes) |
+| File | Examples | 0.3.0 | 0.4.0 |
+|---|---|---|---|
+| `allocator_simulation_spec.rb` | 2 | 150 | 173 |
+| `win_hold_simulation_spec.rb` | 1 | 132 | 160 |
+| `value_allocation_simulation_spec.rb` | 6 | 56 | 85 |
+| `two_layer_simulation_spec.rb` | 3 | 68 | 96 |
+| `tree_recovery_simulation_spec.rb` | 3 | 178 | 515 |
+| `contrasts_simulation_spec.rb` | 2 | 17 | 19 |
+| `argmax_accuracy_simulation_spec.rb` | 2 | 232 | 265 |
+| `change_test_simulation_spec.rb` | 4 | 1 | 1 |
+| `odds_simulation_spec.rb` | 3 | - | 33 |
+| `order_simulation_spec.rb` | 13 | - | 667 |
+| All | 39 | 833 (about 14 minutes) | 2,013 (about 34 minutes) |
 
-Without YJIT the same files took about 22 minutes in earlier runs on the same
-machine. The budget is 25 minutes on CI's Ruby 3.4 (the job's timeout is 30).
+In three other runs the order file alone took 263, 311 and 407 seconds, the
+more the busier the machine. Without YJIT the eight files of 0.3.0 took about 22
+minutes in earlier runs on the same machine. The budget is 25 minutes on CI's
+Ruby 3.4; the job's timeout is 45 minutes (30 before 0.4.0).
 
 A change that moves any of these counts changes the rule's behaviour; measure
-again and update this section in the same change.
+again and update these figures in the same change.
 
 ## Development
 

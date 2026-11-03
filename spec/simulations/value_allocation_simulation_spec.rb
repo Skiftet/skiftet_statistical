@@ -114,9 +114,9 @@ module ValueAllocationSimulation
     end
   end
 
+  # A visit's arm by the latest weights: the library's one draw by weight, the weights read in `arms` order.
   def pick(weights, arms, roll)
-    cumulative = 0.0
-    arms.find { |arm| (cumulative += weights[arm]) > roll } || arms.last
+    SkiftetStatistical::Bandit::Draw.from_weights(arms.to_h { |arm| [ arm, weights.fetch(arm) ] }, roll)
   end
 
   # One visit's values, part by part (two uniforms a count part, one a binary part), each probability times `factor`.

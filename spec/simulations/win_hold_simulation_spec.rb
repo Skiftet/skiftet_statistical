@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# The hold on an automatic win, simulated (moved from f1's spec/services/experiments/win_hold_simulation_spec.rb
+# The hold on an automatic win, simulated (moved into this library unchanged,
 # with the same seeds, runs, passes, draws and bounds): a win counts only after the same arm met the win rule at
 # every 15-minute pass for 24 hours. Tagged `simulation: true`: excluded unless SIMULATIONS=1
 # (spec/spec_helper.rb); CI runs it in its simulations job. Measured results, with and without the hold:
@@ -10,7 +10,7 @@
 # draws 40 visits by the current weights, each exposure counts 1 / the weight it was drawn under (with the sum of
 # the squares, for the Kish n), the allocator gets the previous weights, and the hold is Bandit::WinHold on a clock
 # that moves 15 minutes per pass, with the previous pass one tick back as its last_pass_at (with no last pass the
-# hold counts as interrupted). The decision step is f1's ExperimentAllocationJob#decide: the allocator with
+# hold counts as interrupted). The decision step is an allocation job's: the allocator with
 # hold_satisfied: hold.satisfied?, and the same seed again without the hold when the arm that wins now is not the
 # arm that held.
 module WinHoldSimulation
@@ -22,9 +22,9 @@ module WinHoldSimulation
     { exposures: 0, conversions: 0, weighted_exposures: 0.0, weighted_conversions: 0.0, weighted_exposures_squared: 0.0 }
   end
 
+  # A visit's arm by the latest weights: the library's one draw by weight, the weights read in `arms` order.
   def pick(weights, arms, roll)
-    cumulative = 0.0
-    arms.find { |arm| (cumulative += weights[arm]) > roll } || arms.last
+    SkiftetStatistical::Bandit::Draw.from_weights(arms.to_h { |arm| [ arm, weights.fetch(arm) ] }, roll)
   end
 
   # One simulated experiment. Returns the crowned arm, or nil. `hold: false` measures the allocator alone

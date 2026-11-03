@@ -1,12 +1,11 @@
 # frozen_string_literal: true
 
 module SkiftetStatistical
-  # Frequentist significance testing for A/B experiments. Consolidates the
-  # two-proportion z-test, Welch's t-test and the normal CDF that were previously
-  # re-implemented (inconsistently) across mej.la's AbTestAnalyzer and skram.la's
-  # CRM::AbTestAnalysis. One correct, exact (erf-based) normal CDF — no polynomial
-  # approximations. Since 0.2 also the normal quantile, the chi-squared survival
-  # and the sample-ratio check.
+  # Frequentist significance testing for A/B experiments. One home for the
+  # two-proportion z-test, Welch's t-test and the normal CDF, which callers
+  # otherwise re-implement, often inconsistently. One correct, exact (erf-based)
+  # normal CDF — no polynomial approximations. Since 0.2 also the normal
+  # quantile, the chi-squared survival and the sample-ratio check.
   module Significance
     # normal_quantile bisects [-40, 40]: 0.5 * erfc(40 / sqrt(2)) underflows to 0.0,
     # so every p a Float can hold strictly inside (0, 1) has its z in there.

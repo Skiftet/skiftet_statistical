@@ -2,9 +2,9 @@
 
 module SkiftetStatistical
   # Descriptive statistics over a collection of numbers — mean, variance,
-  # standard deviation, and interpolated percentiles. Consolidates the ad-hoc
-  # mean/variance (skram.la's revenue-per-visitor stats) and percentile logic
-  # (ekonomidata.nu's income distributions) scattered across the workspace.
+  # standard deviation, and interpolated percentiles. One home for the mean and
+  # variance of an amount per view and the percentiles of a distribution, so
+  # callers stop writing their own ad-hoc copies.
   module Descriptive
     module_function
 

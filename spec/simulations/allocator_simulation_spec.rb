@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
-# The automatic win rule under repeated looks, simulated (moved from f1's
-# spec/services/experiments/allocator_simulation_oracle_spec.rb with the same seeds, runs, passes, draws and
+# The automatic win rule under repeated looks, simulated (moved into this library unchanged: the same seeds, runs,
+# passes, draws and
 # bounds). Tagged `simulation: true`: excluded unless SIMULATIONS=1 (spec/spec_helper.rb); CI runs them in its
 # simulations job. Measured results: README.md, "Bandit simulations: measured results".
 #
@@ -17,9 +17,9 @@ module AllocatorSimulation
     { exposures: 0, conversions: 0, weighted_exposures: 0.0, weighted_conversions: 0.0 }
   end
 
+  # A visit's arm by the latest weights: the library's one draw by weight, the weights read in `arms` order.
   def pick(weights, arms, roll)
-    cumulative = 0.0
-    arms.find { |arm| (cumulative += weights[arm]) > roll } || arms.last
+    SkiftetStatistical::Bandit::Draw.from_weights(arms.to_h { |arm| [ arm, weights.fetch(arm) ] }, roll)
   end
 
   # One simulated experiment. Returns the crowned arm, or nil.

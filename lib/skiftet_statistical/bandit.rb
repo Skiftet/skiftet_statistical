@@ -6,11 +6,11 @@ module SkiftetStatistical
   # in the arms, so a bandit serialises to a plain Hash and back for persistence.
   #
   #   bandit = SkiftetStatistical::Bandit.new(
-  #     arms: %w[facebook whatsapp x],
+  #     arms: %w[a b c],
   #     policy: SkiftetStatistical::Policies::ThompsonSampling.new,
   #   )
-  #   choice = bandit.select          # => "whatsapp"
-  #   bandit.record("whatsapp", 1)    # a conversion
+  #   choice = bandit.select          # => "b"
+  #   bandit.record("b", 1)           # an outcome of 1
   #   bandit.best_arm                 # => highest empirical mean
   class Bandit
     attr_reader :policy

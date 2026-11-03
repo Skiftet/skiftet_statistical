@@ -1,7 +1,10 @@
 # frozen_string_literal: true
 
+require_relative "numbers"
+require_relative "inputs"
 require_relative "beta_function"
 require_relative "gauss_legendre"
+require_relative "significance"
 
 module SkiftetStatistical
   # Which of several independent Beta variables is the largest: the exact probability of each member, the seedless
@@ -47,6 +50,34 @@ module SkiftetStatistical
   #
   # Members are given as [[alpha, beta], ...], 1 to MAX_MEMBERS of them, alpha and beta finite numbers > 0, inside the
   # limits above for probabilities and pick. Every answer breaks a tie to the lower index.
+  #
+  # Since 0.4.0 three more answers sit beside these, each new and each leaving probabilities, pick and greedy as they
+  # were (pick still compares its own position, below):
+  #
+  # expected_maximum is E[max] = 1 - the integral over (0, 1) of the product of the members' distribution functions,
+  # by the same panels and the same rule. Each half is integrated in the distance w from its own end, so the part below
+  # 1/2 is the integral of the product, and the part above is 1/2 less the integral of 1 - the product of the
+  # reflected members' complements: both integrands vanish at w = 0, so leaving out what lies below the half's lowest
+  # quantile at TAIL costs at most TAIL a member.
+  #
+  # position is a comparison key of a draw: where the member's quantile at a uniform lies, on the scale pick compares,
+  # which rounds at neither end. It solves the same distribution function as the integral, by Newton's method in v
+  # inside a bracket that always holds the root, halving the bracket whenever a step would leave it or fails to halve
+  # the step before (Numerical Recipes' rtsafe), from a Normal start. The bracket comes from the leading term
+  # w**p / (p * B(p, q)), which bounds the distribution function from above when q >= 1 and from below when q < 1, the
+  # other end the joint (or, for q < 1, the leading term less (1 - q) * log(2) / p, since (1 - w)**(q - 1) <= 2**(1 - q)
+  # on (0, 1/2]). It is a separate method from the bisection pick compares, faster, and within the distribution
+  # function's noise of it except near the ends of (0, 1).
+  #
+  # distribution is that distribution function itself, F(x) of one member: the one probabilities, pick, position and
+  # expected_maximum read, so a caller integrating against it reads the same function, bit for bit.
+  #
+  # The three read their numbers by the library's one number reader (SkiftetStatistical::Numbers, the input domain)
+  # and hold a member to the limits probabilities and pick take, an ArgumentError otherwise.
+  #
+  #   SkiftetStatistical::BetaArgmax.expected_maximum([ [ 1.0, 1.0 ], [ 1.0, 1.0 ] ])      # => 2/3
+  #   SkiftetStatistical::BetaArgmax.position(0.5, 2.0, 2.0)                               # => 0.0, the draw 1/2
+  #   SkiftetStatistical::BetaArgmax.distribution(0.3, 2.0, 8.0)                           # => 0.8039967659999996
   module BetaArgmax
     # The probability left out of the integration range at each end.
     TAIL = 1e-10
@@ -74,6 +105,12 @@ module SkiftetStatistical
     NEWTON_TOLERANCE = 1e-14
     # A bound, not a tuning knob: up to LARGEST_TOTAL the fraction converges within 600 steps (measured).
     FRACTION_STEPS = 20_000
+    # position stops once a step in v is this small relative to max(1, |v|). A Newton step this small leaves an error
+    # far below it, and a halving step leaves at most it.
+    POSITION_TOLERANCE = 1e-13
+    # A bound, not a tuning knob: halving alone narrows the widest bracket (about 1e9 wide, at SMALLEST_PARAMETER and a
+    # uniform of 1e-300) to POSITION_TOLERANCE within 80 steps.
+    POSITION_STEPS = 200
 
     class << self
       # P(member c is the largest), mixed with epsilon / k, for every member in order; [1.0] for one member.
@@ -105,7 +142,7 @@ module SkiftetStatistical
 
         return first_smallest(priorities) if explore < epsilon
 
-        first_largest(members.each_with_index.map { |(alpha, beta), j| position(uniforms[j], alpha, beta) })
+        first_largest(members.each_with_index.map { |(alpha, beta), j| pick_position(uniforms[j], alpha, beta) })
       end
 
       # The index of the largest mean alpha / (alpha + beta).
@@ -113,7 +150,60 @@ module SkiftetStatistical
         first_largest(members(params).map { |alpha, beta| alpha / (alpha + beta) })
       end
 
+      # E[max] of the members, 1 - the integral over (0, 1) of the product of their distribution functions; one
+      # member's mean exactly.
+      def expected_maximum(params)
+        members = integrable(members(read_members(params)))
+        if members.size == 1
+          alpha, beta = members.first
+          return alpha / (alpha + beta)
+        end
+
+        below = area(members) { |cdfs| cdfs.inject(:*) }
+        above = area(members.map(&:reverse)) { |cdfs| 1.0 - cdfs.inject(1.0) { |product, cdf| product * (1.0 - cdf) } }
+        0.5 - below + above
+      end
+
+      # Where the draw of Beta(alpha, beta) at uniform lies: log(2 * x) up to 1/2, then -log(2 * (1 - x)), so
+      # x = exp(p + JOINT) for a position p < 0, else 1 - exp(JOINT - p). Minus infinity at a uniform of 0 and infinity
+      # at 1. uniform lies in [0, 1]; alpha and beta inside the limits pick takes.
+      def position(uniform, alpha, beta)
+        uniform = unit(Numbers.read(uniform, "uniform"), "uniform")
+        alpha, beta = member(alpha, beta)
+
+        locate(uniform, alpha, beta)
+      end
+
+      # The Beta(alpha, beta) distribution function at x, I_x(alpha, beta): the one this module integrates, picks and
+      # positions on (0.2.0's arithmetic with the fraction run to convergence), read at v = log x. 0.0 at or below 0
+      # and 1.0 at or above 1. x is a finite number; alpha and beta inside the limits pick takes.
+      def distribution(x, alpha, beta)
+        x = Numbers.read(x, "x")
+        alpha, beta = member(alpha, beta)
+        return 0.0 unless x.positive?
+        return 1.0 if x >= 1.0
+
+        cdf(Math.log(x), x, alpha, beta, log_constant(alpha, beta))
+      end
+
       private
+
+      # The members a method new in 0.4.0 takes, read for the readers below (members, integrable), which then bound
+      # them as they bound every member: params an Array of [alpha, beta] pairs, each read by the library's one
+      # reading of a pair (Numbers.pair, its numbers in the input domain) and answered as its Floats, so a value those
+      # readers cannot ask (one that answers no method, say) is an ArgumentError too.
+      def read_members(params)
+        unless Array === params
+          raise ArgumentError, "params must be a non-empty Array of [alpha, beta] pairs, got #{Inputs.shown(params)}"
+        end
+
+        Inputs.elements(params).each_with_index.map { |pair, i| Numbers.pair(pair, "member #{i}", %w[alpha beta]) }
+      end
+
+      # One member's alpha and beta, read (read_members) and held inside the limits pick takes (members, integrable).
+      def member(alpha, beta)
+        integrable(members(read_members([ [ alpha, beta ] ]))).first
+      end
 
       # Each member's integral of f_c * product of the others' F: its part below 1/2 plus its part above, where an
       # other member's F(1 - w) is 1 minus the reflected member's distribution function at w.
@@ -152,6 +242,28 @@ module SkiftetStatistical
         sums
       end
 
+      # The integral over one half of a function of the members' distribution functions, given the members'
+      # parameters in that half: over w in (0, 1/2] in v = log w, so dw = w dv. The block turns the members'
+      # distribution functions at w into the integrand, which must vanish as w goes to 0. The panels are those of
+      # points, run up to the joint whatever the members, since the integrand need not vanish there.
+      def area(shapes)
+        rule = GaussLegendre.nodes(NODES)
+        constants = shapes.map { |p, q| log_constant(p, q) }
+        sum = 0.0
+        (points(shapes).select { |v| v < JOINT } << JOINT).sort.uniq.each_cons(2) do |left, right|
+          half_width = (right - left) / 2.0
+          middle = (left + right) / 2.0
+          panel = 0.0
+          rule.each do |node, weight|
+            v = middle + (half_width * node)
+            w = Math.exp(v)
+            panel += weight * w * yield(shapes.each_with_index.map { |(p, q), j| cdf(v, w, p, q, constants[j]) })
+          end
+          sum += half_width * panel
+        end
+        sum
+      end
+
       # The panels of one half in v: every member's quantiles at BREAKS that lie in it, sorted, each once, closed by
       # the joint unless every member's top quantile stops short of it. A member's quantiles rise with the level, so
       # the smallest is min_j Q_j(TAIL) and, short of the joint, the largest is max_j Q_j(1 - TAIL). No level below
@@ -170,7 +282,9 @@ module SkiftetStatistical
 
       # Where a draw lies, on a scale that rises with x and rounds at neither end: log(2 * x) up to 1/2, then
       # -log(2 * (1 - x)), each read through the quantile of its own half.
-      def position(uniform, alpha, beta)
+      # (0.3.0's private position, the key pick compares, renamed in 0.4.0 only because the public position took its
+      # name; its code is 0.3.0's.)
+      def pick_position(uniform, alpha, beta)
         return -Float::INFINITY if uniform.zero?
         return Float::INFINITY if uniform == 1.0
 
@@ -182,6 +296,74 @@ module SkiftetStatistical
         return JOINT - log_quantile(level, beta, alpha) if level < 1.0
 
         JOINT - Math.log(1.0 - quantile(uniform, alpha, beta, constant))
+      end
+
+      # The public position, its inputs read: each half's quantile solved by log_position.
+      def locate(uniform, alpha, beta)
+        return -Float::INFINITY if uniform.zero?
+        return Float::INFINITY if uniform == 1.0
+
+        constant = log_constant(alpha, beta)
+        return log_position(uniform, alpha, beta, constant) - JOINT if uniform < cdf(JOINT, 0.5, alpha, beta, constant)
+
+        # 1 - uniform rounds to 1 only under 2**-53; x itself says that draw, unless beta is as small as the uniform.
+        level = 1.0 - uniform
+        return JOINT - log_position(level, beta, alpha, log_constant(beta, alpha)) if level < 1.0
+
+        JOINT - Math.log(1.0 - quantile(uniform, alpha, beta, constant))
+      end
+
+      # log Q(level; p, q) for a level in (0, 1) whose quantile lies in (0, 1/2]: the root in v of
+      # log I_w(p, q) - log(level), by Newton's method inside a bracket that always holds it (see the module's notes).
+      # A step that would leave the bracket, or that is not at most half the step before the last, halves the bracket
+      # instead, so the answer is found however flat or steep the distribution function is. The bracket's first ends
+      # hold the root by arithmetic, not by a value read there, and the leading term is exact when q is 1, so a step
+      # that passes an end not yet tried (by rounding, or by overshooting) tries that end itself.
+      def log_position(level, p, q, constant)
+        target = Math.log(level)
+        leading = (target - constant + Math.log(p)) / p
+        if q >= 1.0
+          low = [ leading, JOINT ].min
+          high = JOINT
+        else
+          low = [ leading - ((1.0 - q) * Math.log(2.0) / p), JOINT ].min
+          high = [ leading, JOINT ].min
+        end
+        low_tried = high_tried = false
+
+        total = p + q
+        start = (p / total) + (Math.sqrt(p * q / (total * total * (total + 1.0))) * Significance.normal_quantile(level))
+        v = (start.positive? ? Math.log(start) : leading).clamp(low, high)
+
+        step = Float::INFINITY
+        POSITION_STEPS.times do
+          w = Math.exp(v)
+          below = cdf(v, w, p, q, constant)
+          gap = Math.log(below) - target
+          return v if gap.zero?
+
+          if gap.negative?
+            low = v
+            low_tried = true
+          else
+            high = v
+            high_tried = true
+          end
+          newton = gap / Math.exp(constant + (p * v) + ((q - 1.0) * Math.log(1.0 - w)) - Math.log(below))
+          landing = v - newton
+          landing = low if !low_tried && landing < low
+          landing = high if !high_tried && landing > high
+          before = step
+          step = v - landing
+          if newton.finite? && landing.between?(low, high) && (2.0 * step).abs <= before.abs
+            v = landing
+          else
+            step = (high - low) / 2.0
+            v = low + step
+          end
+          break if step.abs <= POSITION_TOLERANCE * [ 1.0, v.abs ].max
+        end
+        v
       end
 
       # log Q(level; p, q) for a level in (0, 1) whose quantile lies in (0, 1/2]: the bisection while that can say it,

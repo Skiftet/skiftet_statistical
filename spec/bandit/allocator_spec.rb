@@ -3,8 +3,8 @@
 module BanditAllocatorPins
   DRAWS = 500
 
-  # Seeded outputs at 500 draws, as f1's Experiments::Allocator gave them before the rule moved here (f1's own pins
-  # of the same rule are spec/services/statistics_golden_draws_spec.rb). Floats compare at 1e-9 relative, so a
+  # Seeded outputs at 500 draws, as the rule's earlier implementation gave them before the rule moved here (that
+  # implementation pins the same rule in its own suite). Floats compare at 1e-9 relative, so a
   # libm that rounds a last digit differently still passes while an added, dropped or reordered draw (which moves
   # every later draw, JointBeta) does not; every other value, every Hash's key order and every Array's order exact.
   FIXTURES = {
@@ -166,7 +166,7 @@ RSpec.describe SkiftetStatistical::Bandit::Allocator do
   describe "Config" do
     let(:config_class) { described_class::Config }
 
-    it "defaults to f1's settings" do
+    it "has the default settings and at most ten arms" do
       expect(config_class.new.to_h).to eq(
         warmup_exposures: 300, floor: 0.10, max_step: 0.15, win_p_best: 0.95, win_loss: 0.0025, won_share: 0.95,
         won_rest: 0.05, result_changed_below: 0.5, credible_mass: 0.95, prior_alpha: 1.0, prior_beta: 1.0
@@ -637,7 +637,7 @@ RSpec.describe SkiftetStatistical::Bandit::Allocator do
     end
   end
 
-  # f1's surge trap (its allocator_simulation_oracle_spec "a traffic surge during a shift"): two arms that convert
+  # The surge trap (a traffic surge during a shift): two arms that convert
   # equally; the allocation favours one 90/10 while the base rate doubles. Raw counts read the surge as the arm's
   # lead; counts weighted by 1 / the share each visit was drawn under do not.
   describe "a traffic surge during a shift" do

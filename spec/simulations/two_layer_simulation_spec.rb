@@ -18,13 +18,15 @@
 # noise floor: the same simulation, seeds and runs with every cell's level equal. Every pass fitting the variances by
 # moments instead is measured and reported beside it, with no bound.
 #
-# (j) Two options above an inner layer that picks one item among each option's candidates. The inner layer's pick
-# probabilities are exact (BetaArgmax.probabilities, an epsilon of 0.1 over Beta states), each visit's shown item is
-# drawn by them (one uniform against those odds: the distribution of the Beta draw they describe, to which SL13 (i)
-# holds BetaArgmax.pick), and each option is scored by the value of its greedy policy (BetaArgmax.greedy at the visit): a visit
-# credits every option whose greedy pick it showed, with 1 / the visit's probability of showing that item (the sum over
-# options of the option's share times its pick probability), through SharedCredit. The same visits scored as they ran
-# (each visit credits its drawn option with 1 / its share) are reported beside.
+# (j) Two options above an inner layer that picks one item among each option's candidates, each option's candidates
+# one posterior set (Bandit::Posteriors.beta over their Beta states). The inner layer's pick probabilities are exact
+# (Posteriors#pick_probabilities, an exploration share of 0.1), each visit's shown item is drawn by them (one uniform
+# against those odds, Bandit::Draw.from_weights: the distribution of the posterior draw they describe, which every
+# source of Posteriors#pick draws exactly), and each option is scored by the value of its greedy policy
+# (Posteriors#greedy at the visit): a visit credits every option whose greedy pick it showed, with 1 / the visit's
+# probability of showing that item (Posteriors.mixture: the sum over options of the option's share times its pick
+# probability), through SharedCredit. The same visits scored as they ran (each visit credits its drawn option with 1 /
+# its share) are reported beside.
 #
 # Every shape is built here from round generic values.
 module TwoLayerSimulation
@@ -71,9 +73,9 @@ module TwoLayerSimulation
     hit ? size.to_f : 0.0
   end
 
+  # A key by its weight: the library's one draw by weight, the weights read in `keys` order.
   def pick(weights, keys, roll)
-    cumulative = 0.0
-    keys.find { |key| (cumulative += weights[key]) > roll } || keys.last
+    SkiftetStatistical::Bandit::Draw.from_weights(keys.to_h { |key| [ key, weights.fetch(key) ] }, roll)
   end
 
   # The per-arm Hajek sums of an ordinary test, as SharedCredit.from_sums reads them.
@@ -409,8 +411,11 @@ RSpec.describe "Two-layer allocation simulation", simulation: true do
     # (a pass without takes the warm-up split and has no P(best), SL2) and over the runs. The score as they ran drives a
     # second allocation beside it, from the same visits, that moves no traffic.
     warm_state = rates.map { |rate| [ 1.0 + (1_000 * rate), 1.0 + (1_000 * (1.0 - rate)) ] }
-    warm_odds = SkiftetStatistical::BetaArgmax.probabilities(warm_state, epsilon: epsilon)
-    warm_greedy = SkiftetStatistical::BetaArgmax.greedy(warm_state)
+    warm_set = SkiftetStatistical::Bandit::Posteriors.beta(
+      warm_state.each_with_index.to_h { |pair, at| [ "w#{at}", pair ] }
+    )
+    warm_odds = warm_set.pick_probabilities(explore: epsilon)[:heads]
+    warm_greedy = warm_set.greedy
 
     runs = 100
     passes = 30
@@ -431,31 +436,31 @@ RSpec.describe "Two-layer allocation simulation", simulation: true do
       chains = { greedy: { previous: nil, weights: split }, as_ran: { previous: nil, weights: split } }
 
       passes.times do
-        odds = { warm: warm_odds, cold: SkiftetStatistical::BetaArgmax.probabilities(cold_state, epsilon: epsilon) }
-        greedy = { warm: warm_greedy, cold: SkiftetStatistical::BetaArgmax.greedy(cold_state) }
+        cold_set = SkiftetStatistical::Bandit::Posteriors.beta(candidates[:cold].map(&:first).zip(cold_state).to_h)
+        odds = { warm: warm_odds, cold: cold_set.pick_probabilities(explore: epsilon)[:heads] }
+        greedy = { warm: warm_greedy, cold: cold_set.greedy }
         showings = Array.new(3) { [ 0.0, 0.0 ] }
         split = chains[:greedy][:weights]
+        # Each item's probability of being shown at a visit of this pass, over every option that has it among its
+        # candidates: the two layers' mixture of the options' shares and their pick probabilities.
+        shown = SkiftetStatistical::Bandit::Posteriors.mixture(shares: split, probabilities: odds)
         80.times do
           option = sim.pick(split, options, traffic.rand)
-          index = sim.pick(odds[option].each_with_index.to_h { |q, at| [ at, q ] }, [ 0, 1, 2 ], traffic.rand)
-          item, rate = candidates[option][index]
+          item = SkiftetStatistical::Bandit::Draw.from_weights(odds[option], traffic.rand)
+          index = candidates[option].index { |name, _| name == item }
+          rate = candidates[option][index].last
           values = [ sim.binary(traffic, rate), sim.count(traffic, 0.05) ]
           exposures[option] += 1
           showings[index][0] += values[0] if option == :cold
           showings[index][1] += 1.0 - values[0] if option == :cold
 
-          # The visit's probability of showing this item, over every option that has it among its candidates.
-          marginal = options.sum do |other|
-            at = candidates[other].index { |name, _| name == item }
-            at ? split[other] * odds[other][at] : 0.0
-          end
-          credit = options.select { |other| candidates[other][greedy[other]].first == item }
-                          .to_h { |other| [ other, 1.0 / marginal ] }
+          marginal = shown.fetch(item)
+          credit = options.select { |other| greedy[other] == item }.to_h { |other| [ other, 1.0 / marginal ] }
           credits[:greedy].add({ credit: credit, values: values }) unless credit.empty?
           credits[:as_ran].add({ credit: { option => 1.0 / split[option] }, values: values })
         end
-        showings.each_with_index do |(taps, misses), index|
-          cold_state[index] = [ cold_state[index][0] + taps, cold_state[index][1] + misses ]
+        showings.each_with_index do |(successes, failures), index|
+          cold_state[index] = [ cold_state[index][0] + successes, cold_state[index][1] + failures ]
         end
 
         chains.each do |score, chain|

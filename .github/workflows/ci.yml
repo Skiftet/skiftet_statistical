@@ -120,7 +120,7 @@ jobs:
         needs.bandit-changes.outputs.changed == 'true'
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       SIMULATIONS: "1"
       RUBY_YJIT_ENABLE: "1"
