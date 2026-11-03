@@ -42,14 +42,12 @@ module SkiftetStatistical
       # nil with no rows.
       def score(rows, depth:)
         names = read_names([ depth ])
-        events = 0
-        total = read_rows(rows).sum(0.0) do |row|
-          events += 1
-          read_log_probs(row, names).first
-        end
-        return nil if events.zero?
+        # The rows are read once into their log probabilities and counted by that list's size, never by a counter
+        # inside sum's block: Ruby 3.4.12's Array#sum may call its block more than once for an element.
+        logs = read_rows(rows).map { |row| read_log_probs(row, names).first }.to_a
+        return nil if logs.empty?
 
-        finite((0.0 - (total / events)) / LOG2)
+        finite((0.0 - (logs.sum(0.0) / logs.size)) / LOG2)
       end
 
       # Per depth after the first, its gain over the depth before it in the order given: `{ depth => { bits:, se:,
