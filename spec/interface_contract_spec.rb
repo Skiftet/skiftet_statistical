@@ -31,6 +31,8 @@ module InterfaceContract
   INPUTS = "spec/inputs_spec.rb"
   PINS = "spec/pins/generic_bandit_pins_spec.rb"
   PROBABILITIES = "spec/bandit/probabilities_spec.rb"
+  INTERVALS = "spec/beta_function_interval_spec.rb"
+  SHARED_PRIOR = "spec/shared_credit_prior_spec.rb"
 
   SET_IS_A_VALUE = [ POSTERIORS, "LO1 is frozen data that no reader changes" ].freeze
   NEGATIVE_COUNT = [ INPUTS, "which amount sum may be below 0 is declared once, for every reader of a tally" ].freeze
@@ -376,6 +378,77 @@ module InterfaceContract
       [ "0 and 1 outside (0, 1); refuses parameters not finite above 0 and a p that is NaN",
         [ [ BETA, "is 0 at and below p = 0 and 1 at and above p = 1" ],
           [ BETA, "refuses parameters that are not finite numbers above 0" ] ] ]
+    ],
+    "BetaFunction.shortest_interval" => [
+      [ "with one peak, the highest-density interval: one density at both ends, the mode and the mass held, no wider",
+        [ [ INTERVALS, "holds the mode, holds the mass, has one density at both ends and is no wider than any interval" ],
+          [ INTERVALS, "is the central interval of a flat density, and the equal-tailed one of a symmetric peak" ] ] ],
+      [ "the closed forms of a density that falls from 0 or rises to 1, and of the flat density",
+        [ [ INTERVALS, "has the closed forms of a density that falls from 0 or rises to 1: Beta(1, b) and Beta(a, 1)" ],
+          [ INTERVALS, "keeps to the boundary of a density that falls or rises with a fractional parameter below 1" ],
+          [ INTERVALS, "is the central interval of a flat density" ] ] ],
+      [ "a U-shaped density: the shorter one-sided interval, the lower on a tie",
+        [ [ INTERVALS, "takes the shorter one-sided interval of a U-shaped density, the lower one on a tie" ] ] ],
+      [ "under the flat prior it holds the observed share of every count, 0 and n included, and of fractional counts",
+        [ [ INTERVALS, "holds the observed share of every count under the flat prior, 0 and n included" ],
+          [ INTERVALS, "holds the mode of fractional (weighted) counts just above an empty count" ],
+          [ INTERVALS, "is 0 to 1 - sqrt(0.05) for one visit and no event at 95 %" ] ] ],
+      [ "exact: no draw", [ [ INTERVALS, "answers the same every time: no draw" ] ] ],
+      [ "refuses a mass not strictly between 0 and 1, then parameters not finite above 0",
+        [ [ INTERVALS, "refuses a mass not strictly between 0 and 1 and parameters not above 0" ] ] ]
+    ],
+    "BetaFunction.mean_intervals" => [
+      [ "a value of 0 or 1 per visit gives the share's own interval",
+        [ [ INTERVALS, "is the share's own interval for a value of 0 or 1 per visit" ] ] ],
+      [ "every mean lies inside its interval and no end is below 0",
+        [ [ INTERVALS, "holds every item's mean, never goes below 0, and gives an item of no event an interval from 0" ],
+          [ INTERVALS, "keeps an item whose visits all hold one value above 0 inside" ] ] ],
+      [ "an item above 0 answers from its own figures alone, the same in any set and on every call",
+        [ [ INTERVALS, "answers an item with a mean above 0 from its own figures alone, the same in any set" ] ] ],
+      [ "a mean of 0 takes the set's value of one event and narrows as its visits grow; none without an event in the set",
+        [ [ INTERVALS, "gives a mean of 0 the set's value of one event" ],
+          [ INTERVALS, "has no interval for any mean of 0 while no item of the set has an event" ] ] ],
+      [ "the normal interval in the large-sample limit, skewed above the mean at a handful of events",
+        [ [ INTERVALS, "matches the normal interval in the large-sample limit and is skewed above the mean" ] ] ],
+      [ "nil without data; the items' keys and order kept; Symbol or String field names",
+        [ [ INTERVALS, "has no interval without data, keeps the items' keys and order" ] ] ],
+      [ "refuses malformed input, and an item whose arithmetic leaves a Float's range, naming it",
+        [ [ INTERVALS, "refuses malformed input with an ArgumentError" ],
+          [ INTERVALS, "refuses an item whose arithmetic leaves a Float's range, naming the item" ] ] ]
+    ],
+    "SharedCredit.with_prior" => [
+      [ "the rule: by hand, and against a Rational reference from rows and from per-arm sums",
+        [ [ SHARED_PRIOR, "tops an arm of one visit up to a strength of 3" ], [ SHARED_PRIOR, "tops both arms up to a strength of 20" ],
+          [ SHARED_PRIOR, "tops both arms of shared rows up (strength 2)" ],
+          [ SHARED_PRIOR, "matches the reference on seeded shared-credit rows of three arms, one never credited" ],
+          [ SHARED_PRIOR, "reads an ordinary test's estimate from per-arm sums as it reads one from rows" ] ] ],
+      [ "an arm at or above the strength, and an arm with no credit, keeps its means and block bit for bit",
+        [ [ SHARED_PRIOR, "tops up only the arm below the strength" ],
+          [ SHARED_PRIOR, "an arm at exactly the strength is not topped up; just above its size it is" ],
+          [ SHARED_PRIOR, "keeps the arms, their order, their names as given, weight sums, Kish's sizes and parts" ] ] ],
+      [ "every credited arm at or above the strength: the estimate as given, every seeded draw and summary the same",
+        [ [ SHARED_PRIOR, "answers the estimate's means, covariance and rounding as given when every arm is at or above" ],
+          [ SHARED_PRIOR, "leaves every seeded draw and summary the same, bit for bit" ],
+          [ SHARED_PRIOR, "still finds a real difference at plenty of visits" ] ] ],
+      [ "in an ordinary test an arm at or above the strength draws the same values beside an arm topped up",
+        [ [ SHARED_PRIOR, "in an ordinary test, an arm at or above the strength draws the same values beside an arm topped up" ] ] ],
+      [ "a part every credited arm holds at one mean keeps it exactly",
+        [ [ SHARED_PRIOR, "a part every arm holds at one mean keeps it exactly, with no prior spread" ] ] ],
+      [ "exactly symmetric, taken by LinearValue at its rounding; read back from JSON it names no parts",
+        [ [ SHARED_PRIOR, "is exactly symmetric and is drawn from" ],
+          [ SHARED_PRIOR, "reads an estimate read back from JSON as it reads the Estimate, naming no parts" ] ] ],
+      [ "keeps the arms, parts, weight sums and Kish's sizes; changes nothing it is given",
+        [ [ SHARED_PRIOR, "keeps the arms, their order, their names as given, weight sums, Kish's sizes and parts" ],
+          [ SHARED_PRIOR, "changes nothing it is given" ] ] ],
+      [ "at a strength of 20 a version of one visit reads near even, none of three visits or fewer reaches 0.95",
+        [ [ SHARED_PRIOR, "the walk's case: one visit against three read P(best) 0.994" ],
+          [ SHARED_PRIOR, "\#{goal}: \#{handful.size} visit(s)" ],
+          [ SHARED_PRIOR, "two versions of one true value read decided under the prior at most once in 50 datasets" ] ] ],
+      [ "refuses a strength below 0 or not finite, a malformed estimate, an arm of size 0, a figure out of a Float's range",
+        [ [ SHARED_PRIOR, "refuses a strength below 0 or that is not a finite number" ],
+          [ SHARED_PRIOR, "refuses an estimate without its Kish's sizes or weight sums, or one that is not an estimate" ],
+          [ SHARED_PRIOR, "refuses an arm with means but a Kish's size of 0" ],
+          [ SHARED_PRIOR, "refuses an estimate whose figures leave a Float's range under the prior" ] ] ]
     ],
     "Gamma.regularized_lower" => [
       [ "within 5e-12 relative of the exact Poisson sum; P + Q = 1",

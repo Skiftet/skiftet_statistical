@@ -11,7 +11,9 @@ Modules:
   t-test, exact normal CDF and two-tailed p-values, the normal quantile, the
   chi-squared survival and the sample-ratio check.
 - **`Gamma`** / **`BetaFunction`** — the regularized incomplete gamma and beta
-  functions, and the Beta quantile.
+  functions and the Beta quantile; since 0.5.0 also the shortest
+  (highest-density) Beta interval, and intervals of means of non-negative
+  values that always hold the mean.
 - **`Sampler`** — Gamma/Beta/Gaussian random sampling, RNG-injectable.
 - **`JointBeta`** — joint Monte Carlo draws over Beta posteriors (P(best),
   expected loss).
@@ -36,7 +38,9 @@ Modules:
   normal) and their weights are uncertain.
 - **`SharedCredit`** — Hájek inverse-propensity means of several parts per arm,
   with one covariance over every (arm, part) pair, when one row may credit
-  several arms; its sums fold once and store as JSON.
+  several arms; its sums fold once and store as JSON. Since 0.5.0 also the
+  estimate under a prior pooled from its own arms, for arms of a handful of
+  visits.
 - **`HierarchicalRates`** — Gamma-Poisson rates on a tree: a node's ratio to
   what its parent leads us to expect, the fit of a level's strength (and of a
   two-groups hot share), the leaf fit, and checks beside them.
@@ -62,7 +66,7 @@ version number promises about seeded answers is under [Stability](#stability).
 In a Gemfile (published on rubygems.org):
 
 ```ruby
-gem "skiftet_statistical", "~> 0.4.0"
+gem "skiftet_statistical", "~> 0.5.0"
 ```
 
 Or build/install locally:
@@ -156,12 +160,49 @@ G.regularized_upper(a, x)                 # Q(a, x) = 1 - P(a, x)
 B = SkiftetStatistical::BetaFunction
 B.regularized(x, alpha, beta)             # I_x(alpha, beta), the Beta(alpha, beta) distribution function
 B.quantile(0.975, 41.0, 361.0)            # its inverse: an exact 95 % credible bound
+B.shortest_interval(0.95, 1.0, 2.0)       # => [0.0, 0.7763...]: the shortest 95 % interval, holding the mode
 ```
 
 The arithmetic and its order are part of the API: an app that pins these
 outputs (at 1e-12, say) compares them with this exact sequence of
 operations, so a reordered formula is a breaking change even when it is "the
 same" formula.
+
+### Intervals that hold their figure
+
+An equal-tailed interval of a share's flat-prior posterior, Beta(1 + c, 1 + n - c),
+leaves the observed share c / n out when c is 0 or n: 0 of 1 reads 1.3-84.2 %.
+`shortest_interval` is the highest-density interval wherever the density has one
+peak or is monotone, so it holds the mode, which under the flat prior is the share:
+
+```ruby
+B.shortest_interval(0.95, 1.0, 2.0)       # => [0.0, 0.776...]  (0 of 1 visit: 0 % inside)
+B.shortest_interval(0.95, 41.0, 261.0)    # => [0.0981, 0.1748] (40 of 300; equal tails: 0.0996-0.1765)
+```
+
+`mean_intervals` does the same for means of non-negative values (a value per
+visit that is never below 0), each read as a share of its visits: with the
+visits' second moment q = n * s^2 + m^2 (s the mean's standard error), one event
+is worth q / m and the item holds n * m^2 / q events; its interval is that worth
+times the shortest interval of the events' flat-prior Beta. The mean always lies
+inside, the interval never goes below 0, a large item's interval is the normal
+one, and a value of 0 or 1 per visit gives the share's own interval. An item
+with a mean of 0 takes the set's value of one event, so it too has an interval:
+
+```ruby
+B.mean_intervals({ "a" => { visits: 342, mean: 0.0058, standard_error: 0.0041 },
+                   "b" => { visits: 300, mean: 0.0, standard_error: 0.0 } }, mass: 0.95)
+# => { "a" => [0.0009, 0.0184], "b" => [0.0, 0.0099] }
+```
+
+Both are exact (no draw) and work by bisection: an interval with one peak
+inside cost 0.7 to 2.0 ms of CPU with YJIT (Beta(3, 341) to
+Beta(40 001, 1 160 001)), a one-sided one 0.06 ms, and `mean_intervals` of ten
+items 9.9 ms, measured on one busy development machine, so a caller with many
+items works them out once a pass rather than once a visit. An item whose
+figures leave a Float's range in this arithmetic is refused, naming the item,
+rather than answered with an infinite or empty interval; what each method
+takes, answers and refuses is under [Interface contract](#interface-contract).
 
 ## Joint Beta draws
 
@@ -955,7 +996,9 @@ weight), a symmetric positive semidefinite covariance, finite numbers, a weight
 for every part. `draws:` is an Integer >= 0 (`summary` needs at least 1).
 `rounding:` (0.0 by default) is how far each covariance entry may be off: hand
 it a `SharedCredit` estimate's `#rounding`, so a covariance summed from rows is
-never refused for its own rounding.
+never refused for its own rounding. An arm of one visit, or of visits that all
+hold one value, has no variance and is drawn as a point; where arms may hold a
+handful of visits, draw from `SharedCredit.with_prior`'s estimate (below).
 
 Measured (`value_allocation_simulation_spec.rb`, below): the 95 % intervals of
 each arm's value and of each difference covered the truth in 377 to 385 of 400
@@ -1070,6 +1113,64 @@ credit, two options of identical value read a mean P(best) of 0.58 and 0.42
 (bound 0.40 to 0.60) where the same visits scored as they ran read 0.63 and
 0.37; in the pooled cells, `contrast_for_fit` left 1,135 of 24,000 cell
 contrasts out of the fit.
+
+### An arm of a handful of visits (`with_prior`)
+
+The sandwich of an arm of one visit, or of visits that all hold one value, is
+exactly 0, so `LinearValue` draws that arm as a point: one visit at 1 against
+three at 0, 1 and 0 reads P(best) 0.994, and one visit at 0 against them 0.114,
+by the one visit's value alone. `with_prior(estimate, strength:)` answers the
+estimate under a prior pooled from its own credited arms, every arm's evidence
+topped up to `strength` visits, for drawing:
+
+```ruby
+estimate = SC.estimate(
+  [ { credit: { a: 1.0 }, values: [ 1.0 ] },
+    { credit: { b: 1.0 }, values: [ 0.0 ] }, { credit: { b: 1.0 }, values: [ 1.0 ] },
+    { credit: { b: 1.0 }, values: [ 0.0 ] } ],
+  arms: %i[a b], parts: %i[converted],
+)
+topped = SC.with_prior(estimate, strength: 20)
+# => { means: { a: [0.525], b: [0.475] }, covariance: [[0.01246875..., 0.0], [0.0, 0.01246875]],
+#      weight_sums: { a: 1.0, b: 3.0 }, effective: { a: 1.0, b: 3.0 } }
+LV.summary(arms: %i[a b], parts: %i[converted], means: topped[:means], covariance: topped[:covariance],
+           parameters: { w: { fixed: 1.0 } }, weights: ->(drawn) { { converted: drawn.fetch(:w) } },
+           draws: 20_000, rng: Random.new(7), rounding: topped.rounding)
+# => P(best) a 0.61965, b 0.38035 (0.994 and 0.006 on the estimate itself)
+```
+
+The prior's mean per part is the credited arms' mean weighted by their Kish's
+sizes n_a, m0 = sum_a n_a * r_a / N; its per-visit covariance is
+V0 = sum_a n_a * (n_a * cov(r_a) + g_a * g_a^T) / N with g_a = r_a - m0, each
+arm's per-visit covariance and its distance from m0, so a spread between the
+arms widens it. An arm of Kish's size n below the strength k takes e = k - n
+visits of it, the Normal mean's rule taken jointly over its parts: means
+(e * m0 + n * r_a) / k, covariance block (n / k)^2 * cov(r_a) +
+(e * V0 + (e * n / k) * g_a * g_a^T) / k^2, and every covariance with another
+arm scaled by n / k, as its means are.
+
+**Where visits are plenty nothing moves.** An arm at or above the strength,
+and an arm with no credit, keeps its means and its own covariance block bit for
+bit; where every credited arm is at or above it, the answer holds the given
+means and covariance, so every seeded draw `LinearValue` takes from it is the
+draw it takes from the estimate. The answer keeps the arms, the parts, the
+weight sums and Kish's sizes (the evidence's own: hand `contrast_for_fit` the
+given estimate, not this one); its rounding is the given one's or, where
+larger, that of an entry it changed. A strength of 0 tops nothing up. Refused
+(`ArgumentError`): a strength below 0 or not a finite number, an estimate
+without its weight sums or Kish's sizes, an arm with means but a Kish's size
+of 0, and an estimate whose figures rise past a Float's largest value under the
+prior (figures so small that the prior's products fall below Float::MIN read
+as 0; no estimate `estimate` answers holds them).
+
+Measured (`shared_credit_prior_spec.rb`), at a strength of 20: a version of
+one visit read P(best) between 0.41 and 0.77 against versions of 1 to 100
+visits, over values of one part, of two parts at uncertain prices and of
+amounts, where the estimate itself read 0.98 or more, or 0.02 or less, in 12 of
+the table's 16 rows; no version of three visits or fewer reached 0.95. Two
+versions of one true value, one of 1 to 3 visits and the other of 3 to 50, read
+decided (a P(best) at or above 0.95) in none of 250 seeded datasets, against
+158 on the estimate itself.
 
 ## Hierarchical Poisson rates (`HierarchicalRates`)
 
@@ -1762,6 +1863,57 @@ Conventions:
   within 0.001 sd of the normal approximation with its first skewness term.
 - Refuses: as `regularized`, for the probability.
 
+#### `BetaFunction.shortest_interval(mass, alpha, beta)`
+
+- Takes: `mass`, a finite real number strictly between 0 and 1 (a String is
+  not one); `alpha` and `beta`, read by `to_f` as `regularized` reads them.
+- Answers: `[lower, upper]`, two Floats with 0 <= lower <= upper <= 1: with one
+  peak inside (alpha, beta > 1) the highest-density interval, its two ends of
+  one density; [0, quantile(mass)] for a density that falls from 0
+  (alpha <= 1 <= beta, not both 1) and [quantile(1 - mass), 1] for one that
+  rises to 1; [(1 - mass) / 2, (1 + mass) / 2] for the flat density; for a
+  U-shaped one (alpha, beta < 1) the shorter of the two one-sided intervals,
+  the lower on a tie.
+- Guarantees (*exact*, by bisection, no draw; the mass goes through
+  `regularized`): the interval holds `mass` within `regularized`'s accuracy,
+  short of it by a Float's last bits at most; with one peak it is no wider than
+  the equal-tailed interval of the mass, or than any interval of a 400-point
+  grid; for alpha, beta >= 1 (not both 1) it holds the mode, so under the flat
+  prior, Beta(1 + c, 1 + n - c), it holds the observed share c / n, at c = 0 and
+  c = n too, where the equal-tailed interval leaves it out, and for fractional
+  counts.
+- Refuses: a mass that is not a finite real number strictly between 0 and 1,
+  then an alpha or beta whose `to_f` is not a finite number above 0.
+
+#### `BetaFunction.mean_intervals(items, mass:)`
+
+- Takes: `items`, a Hash of key => `{ visits:, mean:, standard_error: }`
+  (Symbol or String field names, the keys any objects): the visits a mean of
+  non-negative values is over, its mean per visit and its standard error, each
+  a finite real number >= 0 where given, visits fractional or whole; `mass` as
+  `shortest_interval` takes it.
+- Answers: `{ key => [lower, upper] }` in the items' order. With n the visits,
+  m the mean, s the standard error and q = n s^2 + m^2: q / m times the shortest
+  interval of Beta(1 + k, 1 + n - k), k = n m^2 / q (never above n); for a mean
+  of 0, the set's value of one event (the summed n q over the summed n m of the
+  items above 0) times [0, quantile(mass) of Beta(1, 1 + n)]. nil for an item
+  with a figure missing (nil: its other figures are then not read) or no
+  visits, and for a mean of 0 in a set with no item above 0.
+- Guarantees (*exact*): every mean lies inside its interval and no end is below
+  0; an item with a mean above 0 answers from its own figures alone, the same
+  in any set; a mean of 0's interval narrows as its visits grow; a value of 0
+  or 1 per visit gives the share's own interval (`shortest_interval` of
+  Beta(1 + c, 1 + n - c), within 1e-9); in the normal limit the interval is the
+  normal one (its width within 1 % at about 400 events), and with a handful of
+  events it is skewed above the mean.
+- Refuses: a mass `shortest_interval` refuses; then items that are not a Hash
+  of Hashes, and a visit count, mean or standard error, given beside the other
+  two, that is not a finite real number or is below 0, before any interval is
+  worked out; and, as the item is worked out, an item whose arithmetic leaves a
+  Float's range (a value of one event, its own or the set's, that is not a
+  finite number above 0; visits past about 2**53 that all hold one value),
+  naming the item.
+
 #### `Gamma.regularized_lower(a, x)`
 
 - Answers: P(a, x), the Gamma(a, 1) distribution function; 0.0 for x <= 0.
@@ -1800,6 +1952,41 @@ Conventions:
   such arms; 0.0 when an arm expected to get nothing got some.
 - Guarantees (*exact*): `chi_squared_survival`'s accuracy.
 - Refuses: nothing of its own (a non-Hash raises `NoMethodError`).
+
+### Estimates of several parts (`SharedCredit`)
+
+#### `SharedCredit.with_prior(estimate, strength:)`
+
+- Takes: an estimate in `SharedCredit.estimate`'s shape (an `Estimate`, or a
+  plain Hash such as one read back from JSON), read by Symbol or String, with
+  its weight sums and Kish's sizes; `strength`, a finite real number >= 0, in
+  visits (0 tops nothing up).
+- Answers: an `Estimate` with the same arms in the same order, the parts (none
+  for a plain Hash), the weight sums and Kish's sizes (the evidence's own),
+  the means and covariance under the prior pooled from its own credited arms
+  (the rule under
+  [An arm of a handful of visits](#an-arm-of-a-handful-of-visits-with_prior)),
+  and its rounding: the given one's (0.0 for a plain Hash) or, where larger,
+  that of an entry it changed.
+- Guarantees (*exact*: plain arithmetic in a fixed order, no draw and no `Math`
+  function, so the same Floats everywhere): the rule, against a reference in
+  Rationals that reads the rows, from rows and from per-arm sums alike; the
+  covariance exactly symmetric wherever the given one is (as every estimate
+  `estimate` answers is), and taken by `LinearValue` at the answer's rounding;
+  an arm at or above the strength, and an arm with no credit, keeps its means
+  and covariance block bit for bit; with every credited arm at or above it the
+  answer holds the given means, covariance and rounding, so every seeded
+  `LinearValue` draw and summary is the one the estimate gives; in an ordinary
+  test (no row credits two arms) an arm at or above the strength draws the same
+  values beside an arm topped up; a part every credited arm holds at one mean
+  keeps that mean exactly; the given estimate is not changed.
+  Measured at a strength of 20: a version of one visit reads P(best) between
+  0.41 and 0.77, and no version of three visits or fewer reaches 0.95.
+- Refuses: a strength below 0 or not a finite real number; an estimate that is
+  not a Hash, or whose means, covariance, weight sums or Kish's sizes are
+  missing or malformed; an arm with means but a Kish's size of 0, each before
+  anything is computed; and, as it is computed, an estimate whose figures leave
+  a Float's range under the prior ("the sums leave a Float's range").
 
 ## Bandit simulations: measured results
 

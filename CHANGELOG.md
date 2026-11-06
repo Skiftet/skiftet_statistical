@@ -1,10 +1,106 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] - 2026-11-06
 
-Documentation and examples only: no code path changes and no answer moves, for
-any input, key or seed (a patch, by the README's new Stability section).
+Three methods, a minor version by the README's Stability section: one that
+lets an estimate whose arms hold a handful of visits be drawn without reading
+one visit as certain, and two for intervals that always hold the figure they
+stand beside. No answer moves: every 0.4.0 call answers as before, for every
+input, key and seed, and every 0.4.0 spec and pin passes unedited. The
+documentation and examples written since 0.4.0, which move no answer either
+(the Stability and Interface contract sections, the last three items), ship in
+this version too. Pure Ruby, no new dependency, Ruby >= 3.1 as before.
 
+- `SharedCredit.with_prior(estimate, strength:)`: the estimate under a prior
+  pooled from its own credited arms, each arm's evidence topped up to
+  `strength` visits, for `LinearValue` to draw from. Why: the sandwich of an
+  arm of one visit, or of visits that all hold one value, is exactly 0, so
+  `LinearValue` drew that arm as a point, and one visit at 1 against three at
+  0, 1 and 0 read P(best) 0.994; at a strength of 20 it reads 0.620 (20 000
+  draws at one seed). The prior's mean per part is the credited arms' mean
+  weighted by their Kish's sizes; its per-visit covariance is theirs (the
+  sandwich times Kish's size) plus their spread around that mean. An arm of
+  Kish's size n below the strength k takes e = k - n visits of it: means
+  (e * m0 + n * r) / k, covariance block
+  (n / k)^2 * cov + (e * V0 + (e * n / k) * g * g^T) / k^2 (g the arm's
+  distance from m0), every covariance with another arm scaled by n / k. An arm
+  at or above the strength, and an arm with no credit, keeps its means and its
+  covariance block bit for bit; where every credited arm is at or above it the
+  answer holds the given means, covariance and rounding, so every seeded draw
+  and summary is the same. The answer keeps the arms, parts, weight sums and
+  Kish's sizes (the evidence's own); its rounding is the given one's or, where
+  larger, that of an entry it changed. Exact: plain arithmetic, no draw.
+  Refused, as an `ArgumentError`: a strength below 0 or not a finite number,
+  an estimate without its weight sums or Kish's sizes, an arm with means but a
+  Kish's size of 0, and an estimate whose figures rise past a Float's largest
+  value under the prior (figures so small that the prior's products fall below
+  Float::MIN read as 0; no estimate `estimate` answers holds them).
+- `BetaFunction.shortest_interval(mass, alpha, beta)`: the shortest interval
+  holding `mass` of Beta(alpha, beta). With one peak inside (0, 1) it is the
+  highest-density interval, its ends of one density, so it holds the mode; a
+  density that falls from 0 (alpha <= 1 <= beta) gives [0, quantile(mass)],
+  one that rises to 1 gives [quantile(1 - mass), 1]; a flat density the
+  central interval; a U-shaped one the shorter one-sided interval. Why: under
+  the flat prior the mode of Beta(1 + c, 1 + n - c) is the observed share
+  c / n, and the equal-tailed interval leaves that share out at c = 0 and
+  c = n (0 of 1 visit reads 0.013 to 0.842 equal-tailed, 0.000 to 0.776
+  shortest), and out of fractional (weighted) counts just above 0; the
+  shortest interval holds it for every alpha, beta >= 1. By bisection on the
+  side of the peak nearer 0 (a peak above 1/2 is mirrored), no draw. Refused,
+  as an `ArgumentError`: a mass not strictly between 0 and 1, then a
+  parameter whose `to_f` is not a finite number above 0.
+- `BetaFunction.mean_intervals(items, mass:)`: each item's interval of a mean
+  of non-negative values, `{ key => { visits:, mean:, standard_error: } }` in,
+  `{ key => [lower, upper] }` out, read as a share of its visits: with the
+  visits' second moment q = n * s^2 + m^2, one event is worth u = q / m, the
+  item holds k = n * m^2 / q events, and the interval is u times the shortest
+  interval of Beta(1 + k, 1 + n - k). So the mean always lies inside, the
+  interval is never below 0, its variance in the normal limit is s^2 exactly,
+  and a value of 0 or 1 per visit gives the share's own interval. An item with
+  a mean of 0 (no event, a standard error of 0) takes the set's value of one
+  event (summed squares over summed values of the items above 0) and k = 0,
+  so it still has an interval, from 0, which narrows as its visits grow; with
+  no item above 0 it has none. An item with a mean above 0 answers from its
+  own figures alone, the same in any set. nil for an item without data (no
+  visits, no mean or no standard error). Refused, as an `ArgumentError`: a
+  mass not strictly between 0 and 1, items that are not a Hash of Hashes, a
+  figure given beside the other two that is not a finite number, a negative
+  visit count, mean or standard error, and an item whose arithmetic leaves a Float's range (a
+  value of one event that is not a finite number above 0, as only extreme
+  figures give it, or visits past about 2**53 that all hold one value), named
+  in the refusal, rather than answered with an infinite or empty interval.
+- `spec/shared_credit_prior_spec.rb`: the rule by hand and against a Rational
+  reference that reads the rows, from rows and from per-arm sums; the answer
+  unchanged, and every seeded draw and summary the same, where every arm is at
+  or above the strength; an arm at or above it drawing the same values beside a
+  topped-up one in an ordinary test; a table over visit counts and goals
+  (values of one part, of two parts at uncertain prices, and of amounts): at a
+  strength of 20 a version of one visit reads P(best) between 0.41 and 0.77
+  (0.98 or more, or 0.02 or less, in 12 of the table's 16 rows on the estimate
+  itself) and none of three visits or fewer reaches 0.95 (at most 0.90); two
+  versions of one true value read decided (a P(best) at or above 0.95) in 0 of
+  250 seeded datasets, against 158 on the estimate itself; the refusals.
+- `spec/beta_function_interval_spec.rb`: the closed forms (Beta(1, b),
+  Beta(a, 1), the flat density, a symmetric peak), and over a table of
+  parameters and masses the mode held, the mass held, one density at both
+  ends and no wider than the equal-tailed interval or any interval of a
+  400-point grid; every count of 1 to 60 visits holds its share, where the
+  equal-tailed interval misses exactly at 0 and at n; fractional counts just
+  above 0; the U-shaped and monotone cases; refusals. For the means: a 0/1
+  value gives the share's interval, 200 seeded sets hold every mean and never
+  go below 0, the zero item's closed form and its narrowing, no interval in a
+  set of zeros, the normal limit, an item whose visits all hold one value, an
+  item answered alike alone and beside others, missing data, keys and field
+  names, refusals, and the items whose arithmetic leaves a Float's range.
+- The README's Interface contract lists the three methods, each with what it
+  takes, answers, guarantees (each *exact*) and refuses, as its doc comment
+  states them, and `spec/interface_contract_spec.rb` indexes the examples
+  behind their 22 guarantees.
+- Costs, measured as CPU time with YJIT on one development machine while other
+  work kept it busy (a load average near 30): `shortest_interval` 0.06 ms for
+  a one-sided interval and 0.7 to 2.0 ms with one peak inside (Beta(3, 341) to
+  Beta(40 001, 1 160 001)); `mean_intervals` of ten items 9.9 ms;
+  `with_prior` of four arms and two parts 0.04 ms.
 - README: a Stability section (a change that moves a seeded answer for the same
   inputs is a major or minor version, as its entry here states, never a patch)
   and an Interface contract section: for each method an application calls,
@@ -28,7 +124,7 @@ any input, key or seed (a patch, by the README's new Stability section).
   `Integer()`; `JointBeta`'s refusal of a parameter not above 0;
   `sample_ratio_p_value`'s `minimum_total` above its default.
 
-## [0.4.0] - unreleased
+## [0.4.0] - 2026-11-03
 
 The generic bandit: one posterior set of items, ordered and picked by one rule
 from a key, given uniforms or an RNG, with the odds of what that rule draws

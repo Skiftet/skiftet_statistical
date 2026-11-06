@@ -52,6 +52,8 @@ module SkiftetStatistical
   #
   # `contrast` gives one difference with its plug-in variance; `contrast_for_fit` gives it with one per-visit variance
   # pooled over the two arms, for a fit that pools contrasts across cells, and leaves out an arm of a small Kish's size.
+  # `with_prior` answers the estimate under a prior pooled from its own credited arms, every arm below a strength
+  # topped up to it, for drawing where an arm holds only a handful of visits.
   #
   # An estimate is a Hash of exactly those four keys that also names its parts (Estimate#parts) and its rounding
   # (Estimate#rounding), so `linear` and `contrast` read a Hash of weights by name. Read back from JSON it is a plain
@@ -186,6 +188,80 @@ module SkiftetStatistical
         pooled = Read.result(((size_arm * per_visit_arm) + (size_reference * per_visit_reference)) / (size_arm + size_reference))
         variance = Read.result(pooled * ((1.0 / size_arm) + (1.0 / size_reference)))
         { mean: Read.result(mean_arm - mean_reference), variance: variance }
+      end
+
+      # The estimate under a prior pooled from its own credited arms, each arm's evidence topped up to `strength`
+      # visits, for drawing (LinearValue) where an arm holds only a handful of visits.
+      #
+      #   estimate = SkiftetStatistical::SharedCredit.estimate(rows, arms: %i[a b], parts: %i[converted])
+      #   SkiftetStatistical::SharedCredit.with_prior(estimate, strength: 20)
+      #
+      # Why: the sandwich of an arm of one visit, or of visits that all hold one value, is exactly 0, so every draw
+      # takes that arm's means as certain, and an arm of one visit against an arm of three reads P(best) near 0.99 or
+      # near 0.01 by the order of their values alone.
+      #
+      # The prior, per pair of parts p and q, from the credited arms a with their Kish's sizes n_a (N their sum), their
+      # means r_a and their covariance blocks: its mean m0_p = sum_a n_a * r_ap / N, and its per-visit covariance
+      # V0_pq = sum_a n_a * (n_a * cov(r_ap, r_aq) + g_ap * g_aq) / N with g_a = r_a - m0: each arm's per-visit
+      # covariance (its sandwich times its Kish's size, as `contrast_for_fit` reads it) and its distance from the
+      # mean, so a spread between the arms widens the prior. A part every credited arm holds at one mean has that mean
+      # as m0_p, exactly. An arm of Kish's size n below the strength k takes e = k - n visits of the prior, the Normal
+      # mean's rule under e visits at m0 and a per-visit covariance V0, taken jointly over its parts:
+      #   means (e * m0 + n * r_a) / k,
+      #   covariance block (n / k)^2 * cov(r_a) + (e / k) * (V0 + (n / k) * g_a * g_a^T) / k,
+      # and every covariance with another arm b scaled by n / k (and by n_b / k when b is topped up too), as the shrunk
+      # means are. An arm at or above the strength, and an arm with no credit, keeps its means and its own covariance
+      # block exactly, bit for bit; where every credited arm is at or above it, the answer holds the given means and
+      # covariance, so every draw LinearValue takes from it is the draw it takes from the estimate. In an ordinary test
+      # (no row credits two arms) an arm at or above the strength also draws the same values in every draw.
+      #
+      # Takes: an estimate in `estimate`'s shape (an Estimate, or a plain Hash such as one read back from JSON), read by
+      # Symbol or String, with its weight sums and Kish's sizes; `strength` a finite real number at least 0, in visits
+      # (0 tops up nothing).
+      #
+      # Answers an Estimate: the same arms in the same order, parts (none when the estimate is read back from JSON),
+      # weight sums and Kish's sizes (the evidence's own, not the prior's: a contrast for a fit reads the given estimate,
+      # not this one), its means and covariance under the prior, and its rounding the given one's (0.0 for a plain Hash)
+      # or, where larger, the rounding of an entry it changed.
+      #
+      # Guarantees (exact: plain arithmetic in a fixed order, no draw and no Math function, so the same estimate and
+      # strength answer the same Floats everywhere): the rule above, the covariance exactly symmetric wherever the given
+      # one is (as every estimate `estimate` answers is); an arm at or above the strength, and an arm with no credit,
+      # keeps its means and covariance block bit for bit, and with every credited arm at or above it the answer holds
+      # the given means, covariance and rounding, so every seeded draw and summary LinearValue takes from it is the one
+      # it takes from the estimate; a part every credited arm holds at one mean keeps that mean exactly; the given
+      # estimate is not changed.
+      #
+      # Refuses, as an ArgumentError: a strength below 0 or not a finite real number; an estimate that is not a Hash, or
+      # whose means, covariance, weight sums or Kish's sizes are missing or malformed (the readers `linear` and
+      # `contrast_for_fit` use, with their words); an arm with means but a Kish's size of 0; and an estimate whose
+      # figures rise past a Float's largest value under the prior ("the sums leave a Float's range"). Figures so small
+      # that the prior's products fall below Float::MIN read as 0 and are not refused; no estimate `estimate` answers
+      # holds them (it refuses such rows itself).
+      def with_prior(estimate, strength:)
+        visits = Read.weight(strength, "strength")
+        arms, rates, covariance, size = read_estimate(estimate)
+        sizes = read_effective(estimate, arms)
+        weight_sums = Read.lookup(estimate, :weight_sums) { raise ArgumentError, "the estimate has no weight sums" }
+        raise ArgumentError, "the estimate's weight sums must be a Hash of arm => sum, got #{weight_sums.class}" unless weight_sums.is_a?(Hash)
+
+        credited = arms.each_index.select { |arm| rates[arm] }
+        credited.each do |arm|
+          raise ArgumentError, "arm #{arms[arm].inspect} has means but a Kish's size of 0" unless sizes[arm].positive?
+        end
+        given = estimate.is_a?(Estimate) ? estimate.rounding : 0.0
+        topped = credited.select { |arm| sizes[arm] < visits }
+        means, covariance, rounding =
+          if topped.empty? then [ rates, covariance, given ]
+          else TopUp.new(rates, covariance, size, sizes, credited, visits, given).answer
+          end
+
+        Estimate.new(estimate.is_a?(Estimate) ? estimate.parts : nil, {
+          means: arms.zip(means).to_h,
+          covariance: covariance,
+          weight_sums: weight_sums.dup,
+          effective: Read.lookup(estimate, :effective) { {} }.dup
+        }, rounding)
       end
 
       private
@@ -362,6 +438,121 @@ module SkiftetStatistical
       end
     end
     private_constant :Read
+
+    # SharedCredit.with_prior's arithmetic on a read estimate: the prior pooled from the credited arms and every arm
+    # below the strength topped up to it. Rates are per arm (nil for an arm with no credit), the covariance arm-major,
+    # sizes the arms' Kish's sizes, `credited` the arms with rates, `visits` the strength and `given` the estimate's
+    # rounding.
+    class TopUp
+      # The units of Float::EPSILON a changed entry may hold as the rounding of its own products and quotients, before
+      # one more per arm summed into the prior.
+      CANCELLATION = 8
+
+      def initialize(rates, covariance, size, sizes, credited, visits, given)
+        @rates = rates
+        @covariance = covariance
+        @size = size
+        @sizes = sizes
+        @credited = credited
+        @visits = visits
+        @given = given
+        @total = credited.sum(0.0) { |arm| sizes[arm] }
+        @centre = Array.new(size) { |part| centre(part) }
+        @gaps = rates.map { |row| row && row.each_index.map { |part| Read.result(row[part] - @centre[part]) } }
+        @shares = sizes.each_index.map { |arm| rates[arm] && sizes[arm] < visits ? sizes[arm] / visits : 1.0 }
+      end
+
+      # [means, covariance, rounding] under the prior.
+      def answer
+        spread, spread_magnitude = prior_covariance
+        inherited = @credited.sum(0.0) { |arm| @sizes[arm] * @sizes[arm] } / @total * @given
+        means = @rates.each_index.map { |arm| topped?(arm) ? shrunk(arm) : @rates[arm] }
+        covariance = @covariance.map(&:dup)
+        rounding = @given
+        cells = @rates.size * @size
+        cells.times do |row|
+          first, part = row.divmod(@size)
+          next unless @rates[first]
+
+          (row...cells).each do |column|
+            second, other = column.divmod(@size)
+            next unless @rates[second] && (topped?(first) || topped?(second))
+
+            value, bound = entry(first, second, part, other, @covariance[row][column], spread, spread_magnitude, inherited)
+            covariance[row][column] = value
+            covariance[column][row] = value
+            rounding = [ rounding, bound ].max
+          end
+        end
+        [ means, covariance, Read.result(rounding) ]
+      end
+
+      private
+
+      def topped?(arm)
+        @shares[arm] < 1.0
+      end
+
+      # m0_p, the visit-weighted mean of the credited arms; the one mean they all hold, exactly, where they agree.
+      def centre(part)
+        values = @credited.map { |arm| @rates[arm][part] }
+        return values.first if values.uniq.size == 1
+
+        Read.result(@credited.sum(0.0) { |arm| @sizes[arm] * @rates[arm][part] } / @total)
+      end
+
+      # [V0, the magnitudes of V0's terms]: per pair of parts, sum_a n_a * (n_a * cov(r_ap, r_aq) + g_ap * g_aq) / N,
+      # on one triangle and mirrored.
+      def prior_covariance
+        spread = Array.new(@size) { Array.new(@size, 0.0) }
+        magnitudes = Array.new(@size) { Array.new(@size, 0.0) }
+        @size.times do |part|
+          (part...@size).each do |other|
+            value = 0.0
+            magnitude = 0.0
+            @credited.each do |arm|
+              own = @sizes[arm] * @covariance[(arm * @size) + part][(arm * @size) + other]
+              gap = @gaps[arm][part] * @gaps[arm][other]
+              value += @sizes[arm] * (own + gap)
+              magnitude += @sizes[arm] * (own.abs + gap.abs)
+            end
+            spread[part][other] = spread[other][part] = Read.result(value / @total)
+            magnitudes[part][other] = magnitudes[other][part] = Read.result(magnitude / @total)
+          end
+        end
+        [ spread, magnitudes ]
+      end
+
+      # (e * m0 + n * r_a) / k, held between the two means it weighs as they are given, so it never rounds past either
+      # and a rate at the prior's mean keeps it exactly.
+      def shrunk(arm)
+        extra = @visits - @sizes[arm]
+        @rates[arm].each_index.map do |part|
+          rate = @rates[arm][part]
+          mean = Read.result(((extra * @centre[part]) + (@sizes[arm] * rate)) / @visits)
+          mean.clamp(*[ @centre[part], rate ].minmax)
+        end
+      end
+
+      # [the entry under the prior, its rounding bound]: the given entry scaled by both arms' n / k, and within a
+      # topped-up arm's block (e / k) * (V0_pq + (n / k) * g_p * g_q) / k added.
+      def entry(first, second, part, other, given_entry, spread, spread_magnitude, inherited)
+        scale = @shares[first] * @shares[second]
+        scaled = scale * given_entry
+        value = scaled
+        terms = scaled.abs
+        bound = scale * @given
+        if first == second
+          extra = (@visits - @sizes[first]) / @visits
+          gap = @shares[first] * @gaps[first][part] * @gaps[first][other]
+          value += extra * (spread[part][other] + gap) / @visits
+          terms += extra * (spread_magnitude[part][other] + gap.abs) / @visits
+          bound += extra * inherited / @visits
+        end
+        [ Read.result(value), Read.result(bound + ((CANCELLATION + @rates.size) * Float::EPSILON * terms)) ]
+      end
+    end
+    private_constant :TopUp
 
     # An estimate: a Hash of exactly means, covariance, weight_sums and effective, which also names the parts its means
     # and covariance are laid out by, and holds `rounding`: the largest bound the snap used, in the covariance's units,
